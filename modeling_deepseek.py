@@ -679,17 +679,20 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def _minmax_normalize(t: torch.Tensor) -> torch.Tensor:
-    """Min-max normalize a [B, S] tensor along the sequence dim to [0, 1].
+def _robust_normalize(t: torch.Tensor) -> torch.Tensor:
+    """Outlier-robust normalize a [B, S] tensor to (0, 1) along the sequence dim.
 
-    Using min-max (rather than z-score) keeps the eviction count content-adaptive:
-    when all tokens are similarly informative they cluster near 1.0 and few fall
-    below the threshold; when genuine low-info tokens exist they stretch toward 0.0.
-    This is what lets a fixed threshold drop a *variable* number of tokens.
+    Min-max collapses under Massive Outliers (an activation outlier with L2 norm
+    ~100x normal would saturate to 1.0 and crush every useful token toward 0,
+    which threshold-eviction would then wrongly drop). We instead use a robust
+    z-score built from the MEDIAN and MAD (median absolute deviation) — neither is
+    dragged by extreme outliers — then squash with a sigmoid so outliers SATURATE
+    near 1.0 while ordinary tokens keep a meaningful spread around 0.5.
     """
-    mn = t.min(dim=-1, keepdim=True).values
-    mx = t.max(dim=-1, keepdim=True).values
-    return (t - mn) / (mx - mn + 1e-6)
+    med = t.median(dim=-1, keepdim=True).values
+    mad = (t - med).abs().median(dim=-1, keepdim=True).values
+    z = (t - med) / (1.4826 * mad + 1e-6)          # 1.4826: MAD->std consistency
+    return torch.sigmoid(z)
 
 
 def compute_latent_info_score(
@@ -762,10 +765,10 @@ def compute_latent_info_score(
 
     # --- Composite information score ---
     info = (
-        w_norm * _minmax_normalize(norm)
-        + w_entropy * _minmax_normalize(neg_entropy)
-        + w_variance * _minmax_normalize(variance)
-        - w_redundancy * _minmax_normalize(redundancy)
+        w_norm * _robust_normalize(norm)
+        + w_entropy * _robust_normalize(neg_entropy)
+        + w_variance * _robust_normalize(variance)
+        - w_redundancy * _robust_normalize(redundancy)
     )
     return info                                               # [B, S]
 
@@ -860,6 +863,11 @@ class DeepseekV2Attention(nn.Module):
         self.latent_eviction = False             # Set True to enable eviction during prefill
         self.latent_eviction_threshold = 0.3     # Drop tokens with info score below this
         self.latent_eviction_window = 4          # Neighbour radius for redundancy detection
+        # Eviction is intentionally restricted to the ONE-SHOT prefill pass. During
+        # autoregressive decode the cache is APPEND-ONLY: no scoring, no top-k, no
+        # gather/slice. Per-token tensor slicing in decode would force repeated
+        # non-contiguous memory copies and tank tokens/s, so it is disabled here.
+        self.latent_eviction_prefill_only = True
         # -----------------------------------------------------------------------
 
     def _init_rope(self):
@@ -915,6 +923,30 @@ class DeepseekV2Attention(nn.Module):
             .contiguous()
         )
 
+    def _should_evict(self, q_len: int, past_key_value: Cache) -> bool:
+        """Decide whether THIS forward call should run latent eviction.
+
+        Policy (validation phase): evict ONLY during the one-shot prefill, keep the
+        decode loop strictly append-only. Eviction is gated on:
+          1. self.latent_eviction enabled, AND
+          2. this is a multi-token step (q_len > 1, i.e. prefill / chunked prefill), AND
+          3. if latent_eviction_prefill_only is True, the layer cache is still EMPTY
+             (the very first prefill). This guards against multi-token *decode*
+             steps (e.g. speculative / assisted decoding) accidentally triggering
+             eviction, which would force per-step tensor gather/slice — exactly the
+             non-contiguous memory-copy that tanks tokens/s.
+        """
+        if not self.latent_eviction or q_len <= 1:
+            return False
+        if not getattr(self, "latent_eviction_prefill_only", True):
+            return True
+        # prefill_only: evict only when no past has been written for this layer yet
+        has_past = (
+            len(past_key_value.key_cache) > self.layer_idx
+            and past_key_value.key_cache[self.layer_idx].numel() > 0
+        )
+        return not has_past
+
     def _evict_and_update_cache(
         self,
         key_states: torch.Tensor,
@@ -960,9 +992,16 @@ class DeepseekV2Attention(nn.Module):
         #   every above-threshold token is kept; batches with fewer simply pad with
         #   their next-best tokens. `k` varies with how many tokens clear the bar.
         keep_mask = info >= self.latent_eviction_threshold        # [B, S] bool
-        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)          # [B], at least 1
-        keep_k = int(keep_counts.max().item())
-        _, keep_idx = info.topk(keep_k, dim=-1, sorted=False)     # [B, keep_k]
+        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)          # [B] per-row real count
+        keep_k = int(keep_counts.max().item())                    # rectangular cache width
+        order = info.argsort(dim=-1, descending=True)             # [B, S] best-first
+        # Per-row slots cycle through THIS row's OWN above-threshold tokens, so the
+        # surplus padding of low-count rows duplicates already-kept important tokens
+        # instead of admitting genuinely low-value ones. This stops Batch>1 alignment
+        # from degenerating back into fixed-ratio eviction. (bsz==1 -> exact top-k.)
+        slot = torch.arange(keep_k, device=info.device)
+        slot = slot.unsqueeze(0) % keep_counts.unsqueeze(1)       # [B, keep_k]
+        keep_idx = order.gather(1, slot)                          # [B, keep_k] seq indices
         keep_idx = keep_idx.sort(dim=-1).values                   # temporal order
 
         # Step 3: Gather key/value only for important tokens
@@ -1056,7 +1095,14 @@ class DeepseekV2Attention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # With latent eviction the physical cache (hence kv_seq_len) is SHORTER than
+        # the true sequence length, yet position_ids still carry TRUE absolute
+        # positions. The rotary tables must be long enough to be indexed by those
+        # true positions, otherwise cos[position_ids] goes out of bounds.
+        rotary_seq_len = kv_seq_len
+        if self.latent_eviction and position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
         ##施加 RoPE 位置编码
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
@@ -1074,15 +1120,16 @@ class DeepseekV2Attention(nn.Module):
         key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            if self.latent_eviction and q_len > 1:
-                # Prefill: score latent vectors and evict low-importance tokens
+            if self._should_evict(q_len, past_key_value):
+                # Prefill only: score latent vectors and evict low-importance tokens
                 # before writing to cache; current chunk still uses all tokens for attention
                 key_states, value_states = self._evict_and_update_cache(
                     key_states, value_states, compressed_kv,
                     past_key_value, cache_kwargs
                 )
             else:
-                # Decode step or eviction disabled: normal full cache update
+                # Decode step (append-only) or eviction disabled: normal full cache
+                # update. No scoring/slicing here -> no per-token memory-copy overhead.
                 key_states, value_states = past_key_value.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
@@ -1205,7 +1252,12 @@ class DeepseekV2FlashAttention2(DeepseekV2Attention):
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # See eager forward: extend rotary tables to cover TRUE positions when
+        # eviction shrinks the physical cache below the real sequence length.
+        rotary_seq_len = kv_seq_len
+        if self.latent_eviction and position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
         query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
@@ -1221,15 +1273,16 @@ class DeepseekV2FlashAttention2(DeepseekV2Attention):
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            if self.latent_eviction and q_len > 1:
-                # Prefill: score latent vectors and evict low-importance tokens
+            if self._should_evict(q_len, past_key_value):
+                # Prefill only: score latent vectors and evict low-importance tokens
                 # before writing to cache; current chunk still uses all tokens for attention
                 key_states, value_states = self._evict_and_update_cache(
                     key_states, value_states, compressed_kv,
                     past_key_value, cache_kwargs
                 )
             else:
-                # Decode step or eviction disabled: normal full cache update
+                # Decode step (append-only) or eviction disabled: normal full cache
+                # update. No scoring/slicing here -> no per-token memory-copy overhead.
                 key_states, value_states = past_key_value.update(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
@@ -1851,6 +1904,7 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         enabled: bool = True,
         threshold: float = 0.3,
         window: int = 4,
+        prefill_only: bool = True,
     ):
         """
         Enable or disable latent KV-cache eviction during chunked prefill.
@@ -1866,6 +1920,11 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
             threshold: Info-score cutoff in roughly [-0.5, 1.0]. Higher = more
                        aggressive eviction (keeps fewer tokens). Typical: 0.2 ~ 0.4.
             window:    Neighbour radius used for redundancy (duplicate) detection.
+            prefill_only: If True (default, recommended for the validation phase),
+                       eviction runs ONLY during the one-shot prefill; the decode
+                       loop stays strictly append-only (no per-token scoring/slicing,
+                       so tokens/s is not hurt). Measure quality first, optimise the
+                       online sliding-window eviction later.
 
         Example::
 
@@ -1873,11 +1932,16 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
             # ... run generation as usual ...
             model.configure_latent_eviction(enabled=False)   # restore default
         """
+        # Model-level flag + true-length counter used by prepare_inputs_for_generation
+        # to keep position_ids (true) and attention_mask length (physical) consistent.
+        self._latent_eviction_active = bool(enabled)
+        self._latent_true_seqlen = 0
         for layer in self.model.layers:
             attn = layer.self_attn
             attn.latent_eviction = enabled
             attn.latent_eviction_threshold = float(threshold)
             attn.latent_eviction_window = int(window)
+            attn.latent_eviction_prefill_only = bool(prefill_only)
 
     @add_start_docstrings_to_model_forward(DeepseekV2_INPUTS_DOCSTRING)
     @replace_return_docstrings(
@@ -1985,6 +2049,72 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         inputs_embeds=None,
         **kwargs,
     ):
+        # ===== Latent-eviction-aware path =====
+        # When eviction is on, the physical KV cache is SHORTER than the true
+        # sequence length. HF's default machinery assumes cache_len == seq_len,
+        # which would otherwise:
+        #   (a) mis-trim input_ids via the (now smaller) seen_tokens,
+        #   (b) build an attention_mask whose length (true) mismatches the physical
+        #       KV length and crash the attention kernel, and
+        #   (c) derive wrong position_ids.
+        # We therefore fully synthesise the inputs here: feed only the genuinely
+        # new token(s), supply TRUE absolute position_ids (for correct RoPE), and a
+        # physical-length all-ones attention_mask (for shape-consistent kernels).
+        if getattr(self, "_latent_eviction_active", False):
+            bsz = input_ids.shape[0]
+            is_prefill = past_key_values is None or (
+                isinstance(past_key_values, Cache)
+                and past_key_values.get_seq_length() == 0
+            )
+            if is_prefill:
+                # Record true context length; let the prompt run through normally.
+                self._latent_true_seqlen = input_ids.shape[1]
+                position_ids = torch.arange(
+                    input_ids.shape[1], dtype=torch.long, device=input_ids.device
+                ).unsqueeze(0)
+                if inputs_embeds is not None:
+                    model_inputs = {"inputs_embeds": inputs_embeds}
+                else:
+                    model_inputs = {"input_ids": input_ids}
+                model_inputs.update(
+                    {
+                        "position_ids": position_ids,
+                        "past_key_values": past_key_values,
+                        "use_cache": kwargs.get("use_cache"),
+                        "attention_mask": attention_mask,
+                    }
+                )
+                return model_inputs
+
+            # ----- Decode step -----
+            true_len = getattr(self, "_latent_true_seqlen", input_ids.shape[1] - 1)
+            new = input_ids.shape[1] - true_len
+            if new < 1:
+                new = 1
+            new_input_ids = input_ids[:, -new:]
+            # TRUE absolute positions for the new token(s) -> correct RoPE phase.
+            position_ids = (
+                torch.arange(
+                    true_len, true_len + new, dtype=torch.long, device=input_ids.device
+                )
+                .unsqueeze(0)
+                .expand(bsz, -1)
+            )
+            # Physical-length all-ones mask -> matches the (compressed) KV cache, so
+            # both the eager 4D-mask path and the flash unpad path stay shape-safe.
+            physical_len = past_key_values.get_seq_length()
+            phys_mask = torch.ones(
+                bsz, physical_len + new, dtype=torch.long, device=input_ids.device
+            )
+            self._latent_true_seqlen = true_len + new
+            return {
+                "input_ids": new_input_ids,
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": phys_mask,
+            }
+        # ===== Default path (unchanged) =====
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()

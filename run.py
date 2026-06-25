@@ -30,9 +30,14 @@ AUTO_DOWNLOAD = True   # 检测到权重缺失时是否自动下载
 
 # 阈值驱逐：信息量低于 threshold 的 latent 才被丢弃，丢弃数量随内容自适应，
 # 不强制固定比例。threshold 越高 → 驱逐越激进（保留越少）。典型范围 0.2 ~ 0.4。
-EVICTION_THRESHOLD = 0.3  # 信息量阈值
-EVICTION_WINDOW    = 4    # 邻居冗余检测窗口半径
-MAX_NEW_TOKENS     = 200  # 生成最多多少个新 token（质量验证时用）
+#
+# 验证阶段策略（重要）：仅在 Prefill 阶段做一次性/分块驱逐；Decode 阶段纯追加，
+# 不做逐 token 的评分/切片，避免显存不连续重排拖垮 tokens/s。先把质量指标测出来，
+# 在线滑窗驱逐留作后续工程加速。该策略由 prefill_only=True 强制保证。
+EVICTION_THRESHOLD = 0.3   # 信息量阈值
+EVICTION_WINDOW    = 4     # 邻居冗余检测窗口半径
+EVICTION_PREFILL_ONLY = True  # 仅 Prefill 驱逐，Decode 纯追加（验证阶段推荐）
+MAX_NEW_TOKENS     = 200   # 生成最多多少个新 token（质量验证时用）
 DTYPE              = torch.bfloat16  # 推理精度，A100/H100 用 bfloat16，其他可改 float16
 
 # 质量验证用的测试 prompt（可随意替换）
@@ -302,7 +307,8 @@ def quality_check(model, tokenizer):
 
         # 开启驱逐
         model.configure_latent_eviction(
-            enabled=True, threshold=EVICTION_THRESHOLD, window=EVICTION_WINDOW
+            enabled=True, threshold=EVICTION_THRESHOLD, window=EVICTION_WINDOW,
+            prefill_only=EVICTION_PREFILL_ONLY,
         )
         text_evict = generate_text(model, tokenizer, prompt)
 
