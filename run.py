@@ -171,6 +171,43 @@ def ensure_weights():
 # ═══════════════════════════════════════════════════════════
 # 1. 加载
 # ═══════════════════════════════════════════════════════════
+def _bind_latent_eviction_config(model):
+    """给加载后的 model 动态注入 configure_latent_eviction 方法。
+
+    run.py 全程通过 model.configure_latent_eviction(...) 批量设置各注意力层的
+    驱逐参数，但建模代码（modeling_deepseek*.py）里并未定义该方法。这里在加载
+    完成后统一注入：遍历所有 DeepseekV2Attention 子模块，把开关与超参写进去。
+
+    参数名映射：
+        enabled      -> module.latent_eviction
+        threshold    -> module.latent_eviction_threshold
+        window       -> module.latent_eviction_window
+        prefill_only -> module.latent_eviction_prefill_only
+    """
+    import types
+
+    def configure_latent_eviction(self, enabled, threshold=None, window=None,
+                                  prefill_only=None):
+        n = 0
+        for module in self.modules():
+            if type(module).__name__ == "DeepseekV2Attention":
+                module.latent_eviction = enabled
+                if threshold is not None:
+                    module.latent_eviction_threshold = threshold
+                if window is not None:
+                    module.latent_eviction_window = window
+                if prefill_only is not None:
+                    module.latent_eviction_prefill_only = prefill_only
+                n += 1
+        return n
+
+    # 仅在建模代码未自带该方法时注入，避免覆盖原生实现
+    if not hasattr(model, "configure_latent_eviction"):
+        model.configure_latent_eviction = types.MethodType(
+            configure_latent_eviction, model
+        )
+
+
 def load_model():
     print("[ 加载 tokenizer ... ]")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
@@ -181,8 +218,12 @@ def load_model():
         trust_remote_code=True,
         torch_dtype=DTYPE,
         device_map="auto",
+        attn_implementation="eager",  # 强制走 DeepseekV2Attention（含驱逐算法）
     )
     model.eval()
+
+    # 注入 configure_latent_eviction（驱逐参数批量配置接口）
+    _bind_latent_eviction_config(model)
 
     # 打印设备分布（多卡场景下有用）
     if hasattr(model, "hf_device_map"):

@@ -860,7 +860,7 @@ class DeepseekV2Attention(nn.Module):
         # of L2 norm, negative entropy, per-dim variance, minus neighbour redundancy).
         # Tokens whose composite info score falls BELOW `threshold` are dropped before
         # the cache write. The number evicted is content-adaptive, NOT a fixed ratio.
-        self.latent_eviction = False             # Set True to enable eviction during prefill
+        self.latent_eviction = True              # Set True to enable eviction during prefill
         self.latent_eviction_threshold = 0.3     # Drop tokens with info score below this
         self.latent_eviction_window = 4          # Neighbour radius for redundancy detection
         # Eviction is intentionally restricted to the ONE-SHOT prefill pass. During
@@ -870,6 +870,9 @@ class DeepseekV2Attention(nn.Module):
         self.latent_eviction_prefill_only = True
         # -----------------------------------------------------------------------
 
+
+##根据模型的配置，初始化对应的旋转位置编码（Rotary Position Embedding, 简称 RoPE）模块
+##注意力机制（Attention）本身是无法感知词语先后顺序的，必须通过“位置编码”来告诉模型每个词的位置
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = DeepseekV2RotaryEmbedding(
@@ -923,125 +926,46 @@ class DeepseekV2Attention(nn.Module):
             .contiguous()
         )
 
-    def _should_evict(self, q_len: int, past_key_value: Cache) -> bool:
-        """Decide whether THIS forward call should run latent eviction.
+    def _compute_keep_indices(self, compressed_kv: torch.Tensor) -> torch.Tensor:
+        """[核心优化点 1：先验特征计算]
 
-        Policy (validation phase): evict ONLY during the one-shot prefill, keep the
-        decode loop strictly append-only. Eviction is gated on:
-          1. self.latent_eviction enabled, AND
-          2. this is a multi-token step (q_len > 1, i.e. prefill / chunked prefill), AND
-          3. if latent_eviction_prefill_only is True, the layer cache is still EMPTY
-             (the very first prefill). This guards against multi-token *decode*
-             steps (e.g. speculative / assisted decoding) accidentally triggering
-             eviction, which would force per-step tensor gather/slice — exactly the
-             non-contiguous memory-copy that tanks tokens/s.
-        """
-        if not self.latent_eviction or q_len <= 1:
-            return False
-        if not getattr(self, "latent_eviction_prefill_only", True):
-            return True
-        # prefill_only: evict only when no past has been written for this layer yet
-        has_past = (
-            len(past_key_value.key_cache) > self.layer_idx
-            and past_key_value.key_cache[self.layer_idx].numel() > 0
-        )
-        return not has_past
-
-    def _evict_and_update_cache(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        past_key_value: Cache,
-        cache_kwargs: dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Evaluate latent information content and selectively write to KV cache.
-
-        Each token's latent c_t^{KV} is scored by compute_latent_info_score (a blend
-        of L2 norm, negative entropy, per-dim variance, minus neighbour redundancy).
-        Tokens whose composite score falls BELOW self.latent_eviction_threshold are
-        dropped before the cache write. The number evicted adapts to the content of
-        the chunk — it is NOT a fixed ratio.
-
-        The returned key/value states contain [past_old | ALL current] so that
-        intra-chunk self-attention remains accurate for the current forward pass.
+        仅在 Layer 0 调用一次。对当前 prefill chunk 的每个 token 的
+        latent c_t^{KV} 用 compute_latent_info_score 评分，通过自适应阈值
+        选出信息量足够的 token 位置索引，供所有层共享使用。
 
         Args:
-            key_states:    [B, H, S, q_head_dim]
-            value_states:  [B, H, S, v_head_dim]
-            compressed_kv: [B, S, kv_lora_rank]  latent vectors for info scoring
-            past_key_value: KV cache (DynamicCache)
-            cache_kwargs:  {"sin": ..., "cos": ...}
+            compressed_kv: [B, S, kv_lora_rank]  — 当前 chunk 的 latent 向量
 
         Returns:
-            (key_states, value_states) with shape [B, H, past_len + q_len, D]
-            for use in the current attention computation.
+            keep_indices: [B, keep_k]  — 按时序升序排列的保留位置
         """
-        bsz, num_heads, q_len, _ = key_states.shape
+        bsz, seq_len, _ = compressed_kv.shape
 
-        # Step 1: Composite information score per token — [B, S]
+        # 复合信息量评分 [B, S]（沿用原有 compute_latent_info_score）
         info = compute_latent_info_score(
             compressed_kv, window=self.latent_eviction_window
         )
 
-        # Step 2: Threshold-based selection (content-adaptive, not a fixed ratio).
-        #   keep_mask marks tokens whose info >= threshold. The cache tensor must be
-        #   rectangular, so the kept count `k` is the max number of above-threshold
-        #   tokens across the batch (>=1). Ranking by info and taking top-k guarantees
-        #   every above-threshold token is kept; batches with fewer simply pad with
-        #   their next-best tokens. `k` varies with how many tokens clear the bar.
-        keep_mask = info >= self.latent_eviction_threshold        # [B, S] bool
-        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)          # [B] per-row real count
-        keep_k = int(keep_counts.max().item())                    # rectangular cache width
-        order = info.argsort(dim=-1, descending=True)             # [B, S] best-first
-        # Per-row slots cycle through THIS row's OWN above-threshold tokens, so the
-        # surplus padding of low-count rows duplicates already-kept important tokens
-        # instead of admitting genuinely low-value ones. This stops Batch>1 alignment
-        # from degenerating back into fixed-ratio eviction. (bsz==1 -> exact top-k.)
-        slot = torch.arange(keep_k, device=info.device)
-        slot = slot.unsqueeze(0) % keep_counts.unsqueeze(1)       # [B, keep_k]
-        keep_idx = order.gather(1, slot)                          # [B, keep_k] seq indices
-        keep_idx = keep_idx.sort(dim=-1).values                   # temporal order
+        # 自适应阈值过滤（非固定比例）
+        keep_mask   = info >= self.latent_eviction_threshold       # [B, S] bool
+        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)           # [B]，统计每个 Sequence 中及格的 Token 数量
+        keep_k      = int(keep_counts.max().item())                #找出当前 Batch 中，保留 Token 数量最多的那个 Sequence 的长度
 
-        # Step 3: Gather key/value only for important tokens
-        idx_k = keep_idx.unsqueeze(1).unsqueeze(-1)          # [B, 1, keep_k, 1]
-        key_to_cache = key_states.gather(
-            2, idx_k.expand(-1, num_heads, -1, key_states.shape[-1])
-        )   # [B, H, keep_k, q_head_dim]
-        val_to_cache = value_states.gather(
-            2, idx_k.expand(-1, num_heads, -1, value_states.shape[-1])
-        )   # [B, H, keep_k, v_head_dim]
+        # 按信息量降序取 top-keep_k；超额槽位循环复用本行最优 token，
+        # 而非引入低质 token（batch>1 时保证各行独立，bsz==1 时退化为精确 top-k）
+        order    = info.argsort(dim=-1, descending=True)           # [B, S]
+        slot     = torch.arange(keep_k, device=info.device)
+        slot     = slot.unsqueeze(0) % keep_counts.unsqueeze(1)    # [B, keep_k]
+        keep_idx = order.gather(1, slot)
+        keep_idx = keep_idx.sort(dim=-1).values                    # 恢复时序顺序
 
-        # Step 4: Snapshot existing past cache BEFORE this update
-        has_past = (
-            len(past_key_value.key_cache) > self.layer_idx
-            and past_key_value.key_cache[self.layer_idx].numel() > 0
-        )
-        if has_past:
-            past_k = past_key_value.key_cache[self.layer_idx]    # [B, H, past_len, D]
-            past_v = past_key_value.value_cache[self.layer_idx]  # [B, H, past_len, D]
-
-        # Step 5: Write ONLY important tokens to cache (eviction happens here)
-        past_key_value.update(key_to_cache, val_to_cache, self.layer_idx, cache_kwargs)
-
-        # Step 6: Return [past_old | ALL current] for accurate intra-chunk attention
-        # Future chunks will only attend to the evicted-filtered cache (smaller),
-        # but the current chunk still sees all its own tokens.
-        if has_past:
-            full_key = torch.cat([past_k, key_states], dim=2)
-            full_val = torch.cat([past_v, value_states], dim=2)
-        else:
-            full_key = key_states
-            full_val = value_states
-
-        evicted = q_len - keep_k
+        evicted = seq_len - keep_k
         logger.debug(
             f"Latent eviction [layer {self.layer_idx}]: "
-            f"chunk_size={q_len}, kept={keep_k}, evicted={evicted} "
-            f"({evicted / q_len * 100:.1f}%) | threshold={self.latent_eviction_threshold}"
+            f"chunk_size={seq_len}, kept={keep_k}, evicted={evicted} "
+            f"({evicted / seq_len * 100:.1f}%) | threshold={self.latent_eviction_threshold}"
         )
-        return full_key, full_val
+        return keep_idx  # [B, keep_k]
 
     def forward(
         self,
@@ -1100,6 +1024,8 @@ class DeepseekV2Attention(nn.Module):
         # positions. The rotary tables must be long enough to be indexed by those
         # true positions, otherwise cos[position_ids] goes out of bounds.
         rotary_seq_len = kv_seq_len
+
+        ##“欺骗”旋转位置编码模块
         if self.latent_eviction and position_ids is not None:
             rotary_seq_len = max(rotary_seq_len, int(position_ids.max()) + 1)
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
@@ -1120,19 +1046,62 @@ class DeepseekV2Attention(nn.Module):
         key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            if self._should_evict(q_len, past_key_value):
-                # Prefill only: score latent vectors and evict low-importance tokens
-                # before writing to cache; current chunk still uses all tokens for attention
-                key_states, value_states = self._evict_and_update_cache(
-                    key_states, value_states, compressed_kv,
-                    past_key_value, cache_kwargs
+
+            # 在 update 之前判断是否属于首次 prefill（本层 cache 尚为空）
+            # 必须在 update 前检查：update 之后本层 cache 必然非空，检查会失效
+            _is_first_prefill = (
+                q_len > 1
+                and self.latent_eviction
+                and not (
+                    len(past_key_value.key_cache) > self.layer_idx
+                    and past_key_value.key_cache[self.layer_idx].numel() > 0
                 )
-            else:
-                # Decode step (append-only) or eviction disabled: normal full cache
-                # update. No scoring/slicing here -> no per-token memory-copy overhead.
-                key_states, value_states = past_key_value.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs
-                )
+            )
+
+            # [核心优化点 2：区分 Prefill 与 Decode]
+            # 先无条件将完整 token 写入 Cache。Decode 阶段（q_len==1）或
+            # chunked-prefill 续写阶段到此即结束，不触发任何评分/切片，
+            # 彻底杜绝 per-token 非连续内存拷贝导致的 tokens/s 下降。
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+            if _is_first_prefill:
+                # [核心优化点 3：跨层对齐 (Cross-layer Alignment)]
+                # Layer 0 计算驱逐索引并挂载到 Cache 对象上；其余层直接复用，
+                # 保证所有层丢弃的是完全相同位置的 Token，DynamicCache
+                # 各层长度始终一致，避免后续 decode 因层间长度不一而崩溃。
+                if self.layer_idx == 0:
+                    keep_indices = self._compute_keep_indices(compressed_kv)
+                    past_key_value.shared_keep_indices = keep_indices
+                else:
+                    keep_indices = getattr(past_key_value, "shared_keep_indices", None)
+
+                if keep_indices is not None:
+                    # [核心优化点 4：双轨同步切片]
+                    # 用同一份 keep_indices 同时对 key_cache 和 value_cache 做 gather，
+                    # 确保 K/V 位置完全对齐，避免错位导致注意力计算错误。
+                    idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B, 1, keep_k, 1]
+                    trimmed_key = key_states.gather(
+                        2, idx.expand(-1, self.num_heads, -1, key_states.shape[-1])
+                    )   # [B, H, keep_k, q_head_dim]
+                    trimmed_val = value_states.gather(
+                        2, idx.expand(-1, self.num_heads, -1, value_states.shape[-1])
+                    )   # [B, H, keep_k, v_head_dim]
+
+                    # 强制覆写底层 Cache（驱逐在此发生）
+                    past_key_value.key_cache[self.layer_idx]   = trimmed_key
+                    past_key_value.value_cache[self.layer_idx] = trimmed_val
+
+                    # [核心优化点 5：修复 DynamicCache 内置状态]
+                    # update() 在 layer 0 时已将 _seen_tokens 加上了 q_len，
+                    # 在最后一层统一修正为实际保留数量，防止多层分别写引发竞争。
+                    if self.layer_idx == self.config.num_hidden_layers - 1:
+                        past_key_value._seen_tokens = trimmed_key.shape[2]
+
+                    # key_states / value_states 保持完整 [B, H, q_len, D]，
+                    # 当前 prefill 对全量 token 做注意力，保证 intra-chunk 注意力精度；
+                    # 已剪枝的 Cache 仅作用于后续 Decode（更短 KV 序列 → 更低显存）。
 
         ##计算注意力权重attn_weights = Q @ K^T * softmax_scale
         attn_weights = (
@@ -1273,19 +1242,9 @@ class DeepseekV2FlashAttention2(DeepseekV2Attention):
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            if self._should_evict(q_len, past_key_value):
-                # Prefill only: score latent vectors and evict low-importance tokens
-                # before writing to cache; current chunk still uses all tokens for attention
-                key_states, value_states = self._evict_and_update_cache(
-                    key_states, value_states, compressed_kv,
-                    past_key_value, cache_kwargs
-                )
-            else:
-                # Decode step (append-only) or eviction disabled: normal full cache
-                # update. No scoring/slicing here -> no per-token memory-copy overhead.
-                key_states, value_states = past_key_value.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs
-                )
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.

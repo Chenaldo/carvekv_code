@@ -85,7 +85,7 @@ class DeepseekV2Attention(nn.Module):
         # of L2 norm, negative entropy, per-dim variance, minus neighbour redundancy).
         # Tokens whose composite info score falls BELOW `threshold` are dropped before
         # the cache write. The number evicted is content-adaptive, NOT a fixed ratio.
-        self.latent_eviction = False             # Set True to enable eviction during prefill
+        self.latent_eviction = True              # Set True to enable eviction during prefill
         self.latent_eviction_threshold = 0.3     # Drop tokens with info score below this
         self.latent_eviction_window = 4          # Neighbour radius for redundancy detection
         # Eviction is intentionally restricted to the ONE-SHOT prefill pass. During
@@ -95,6 +95,9 @@ class DeepseekV2Attention(nn.Module):
         self.latent_eviction_prefill_only = True
         # -----------------------------------------------------------------------
 
+
+##根据模型的配置，初始化对应的旋转位置编码（Rotary Position Embedding, 简称 RoPE）模块
+##注意力机制（Attention）本身是无法感知词语先后顺序的，必须通过“位置编码”来告诉模型每个词的位置
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = DeepseekV2RotaryEmbedding(
@@ -170,8 +173,8 @@ class DeepseekV2Attention(nn.Module):
 
         # 自适应阈值过滤（非固定比例）
         keep_mask   = info >= self.latent_eviction_threshold       # [B, S] bool
-        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)           # [B]
-        keep_k      = int(keep_counts.max().item())
+        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)           # [B]，统计每个 Sequence 中及格的 Token 数量
+        keep_k      = int(keep_counts.max().item())                #找出当前 Batch 中，保留 Token 数量最多的那个 Sequence 的长度
 
         # 按信息量降序取 top-keep_k；超额槽位循环复用本行最优 token，
         # 而非引入低质 token（batch>1 时保证各行独立，bsz==1 时退化为精确 top-k）
@@ -246,6 +249,8 @@ class DeepseekV2Attention(nn.Module):
         # positions. The rotary tables must be long enough to be indexed by those
         # true positions, otherwise cos[position_ids] goes out of bounds.
         rotary_seq_len = kv_seq_len
+
+        ##“欺骗”旋转位置编码模块
         if self.latent_eviction and position_ids is not None:
             rotary_seq_len = max(rotary_seq_len, int(position_ids.max()) + 1)
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
