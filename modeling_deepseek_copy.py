@@ -100,6 +100,28 @@ class DeepseekV2Attention(nn.Module):
         # gather/slice. Per-token tensor slicing in decode would force repeated
         # non-contiguous memory copies and tank tokens/s, so it is disabled here.
         self.latent_eviction_prefill_only = True
+
+        # ---- Sink / Recency protection (applied on top of any scoring method) ----
+        # Attention sinks: empirically, the first few tokens accumulate disproportionately
+        # large attention across layers ("sink" phenomenon). Their L2 norm is often
+        # unremarkable, so statistical scoring systematically under-values them.
+        # We protect them unconditionally.
+        # Recent tokens: the last few tokens in the chunk have only been attended to by
+        # themselves (column sum is tiny by construction), so query-aware scoring also
+        # under-values them. Protect them unconditionally as well.
+        self.latent_eviction_sink_tokens     = 4    # Always keep first N tokens
+        self.latent_eviction_recent_tokens   = 16   # Always keep last N tokens
+        # Decision layer: eviction indices are computed at this layer and broadcast
+        # to all layers. Layers 0..D-1 are retroactively trimmed on the spot.
+        # Empirically Config-B (layer-0 shared) degrades heavily; features stabilise
+        # around layer 6 in DeepSeek-V2-Lite (oracle gap ≤ 0.5 PPL from L6 onward).
+        self.latent_eviction_decision_layer  = 6    # Layer that computes the decision
+        # Long-sequence guard: full [n_mid, n_mid] scoring matrix is infeasible at
+        # 32k+ prefill (32k × 16 heads × fp32 ≈ 68 GB → OOM).
+        # Subsample K query rows instead; column-sum becomes an unbiased estimator.
+        # Memory: O(K × n) vs O(n²).  32k @ K=512 ≈ 1 GB;  128k @ K=512 ≈ 4 GB.
+        # Lower K to 128–256 if GPU memory is tight; higher K for less rank noise.
+        self.latent_eviction_score_queries   = 512  # Max query rows used for scoring
         # -----------------------------------------------------------------------
 
 
@@ -158,46 +180,143 @@ class DeepseekV2Attention(nn.Module):
             .contiguous()
         )
 
-    def _compute_keep_indices(self, compressed_kv: torch.Tensor) -> torch.Tensor:
-        """[核心优化点 1：先验特征计算]
+    def _compute_keep_indices(
+        self,
+        compressed_kv: torch.Tensor,
+        q_abs: Optional[torch.Tensor] = None,
+        W_UV: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """[核心优化点 1：Value-Aware Query-Aware 评分 + Sink/Recency 保护]
 
-        仅在 Layer 0 调用一次。对当前 prefill chunk 的每个 token 的
-        latent c_t^{KV} 用 compute_latent_info_score 评分，通过自适应阈值
-        选出信息量足够的 token 位置索引，供所有层共享使用。
+        在 latent_eviction_decision_layer 调用一次，供所有层共享驱逐决策。
+
+        评分公式（q_abs 和 W_UV 均可用时）：
+          Importance[j] = mean_H( Σ_i prob_{i,j} × ‖W_UV @ c_j‖₂ )
+
+          · Σ_i prob_{i,j}  ：因果 attention 列求和，衡量「被注意了多少次」
+          · ‖W_UV @ c_j‖₂  ：Value 投影 L2 范数，衡量「影响输出空间的幅度」
+
+          两者相乘的意义：
+            - 虚词（"的"/"了"）注意力列和高但 Value 范数低 → 综合得分中等，可驱逐
+            - 罕见专名注意力中等但 Value 范数高 → 综合得分高，被保留
+
+        退化策略（按可用性自动选择）：
+          · 仅 q_abs          → 纯列求和（无 Value 权重）
+          · 仅 W_UV / 均无    → 统计评分（L2 范数 + 负熵 + 方差 - 冗余），可乘 Value 范数
+
+        无条件保护：
+          · 前 latent_eviction_sink_tokens   个 token（attention sink）
+          · 后 latent_eviction_recent_tokens 个 token（recency 偏差）
 
         Args:
-            compressed_kv: [B, S, kv_lora_rank]  — 当前 chunk 的 latent 向量
+            compressed_kv : [B, S, kv_lora_rank]          归一化 latent
+            q_abs         : [B, H, S, kv_lora_rank] | None  absorbed query
+            W_UV          : [H, v_head_dim, kv_lora_rank] | None  Value 投影矩阵
 
         Returns:
-            keep_indices: [B, keep_k]  — 按时序升序排列的保留位置
+            keep_indices  : [B, keep_k]  按时序升序
         """
-        bsz, seq_len, _ = compressed_kv.shape
+        bsz, seq_len, R = compressed_kv.shape
+        device = compressed_kv.device
 
-        # 复合信息量评分 [B, S]（沿用原有 compute_latent_info_score）
-        info = compute_latent_info_score(
-            compressed_kv, window=self.latent_eviction_window
-        )
+        # ── Sink / Recency 保护边界 ────────────────────────────────────────
+        n_sink   = min(self.latent_eviction_sink_tokens,   seq_len)
+        n_recent = min(self.latent_eviction_recent_tokens, max(0, seq_len - n_sink))
+        n_mid    = seq_len - n_sink - n_recent
 
-        # 自适应阈值过滤（非固定比例）
-        keep_mask   = info >= self.latent_eviction_threshold       # [B, S] bool
-        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)           # [B]，统计每个 Sequence 中及格的 Token 数量
-        keep_k      = int(keep_counts.max().item())                #找出当前 Batch 中，保留 Token 数量最多的那个 Sequence 的长度
+        # ── 用统计阈值估算总 keep_k（自适应驱逐量，与主评分无关）────────────
+        info_all    = compute_latent_info_score(compressed_kv, window=self.latent_eviction_window)
+        keep_mask   = info_all >= self.latent_eviction_threshold
+        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)
+        keep_k      = int(keep_counts.max().item())
+        keep_k      = max(keep_k, n_sink + n_recent + 1)  # sink + recent 必须全留
+        keep_k      = min(keep_k, seq_len)
+        n_mid_keep  = max(0, keep_k - n_sink - n_recent)
 
-        # 按信息量降序取 top-keep_k；超额槽位循环复用本行最优 token，
-        # 而非引入低质 token（batch>1 时保证各行独立，bsz==1 时退化为精确 top-k）
-        order    = info.argsort(dim=-1, descending=True)           # [B, S]
-        slot     = torch.arange(keep_k, device=info.device)
-        slot     = slot.unsqueeze(0) % keep_counts.unsqueeze(1)    # [B, keep_k]
-        keep_idx = order.gather(1, slot)
-        keep_idx = keep_idx.sort(dim=-1).values                    # 恢复时序顺序
+        if n_mid <= 0 or n_mid_keep >= n_mid:
+            keep_idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1).clone()
+            logger.debug(
+                f"Latent eviction [layer {self.layer_idx}]: "
+                f"chunk={seq_len}, no eviction needed (mid={n_mid})"
+            )
+            return keep_idx
 
-        evicted = seq_len - keep_k
+        mid_latent = compressed_kv[:, n_sink : seq_len - n_recent, :]  # [B, n_mid, R]
+
+        # ── Value 范数（预先计算，与评分方法正交）────────────────────────────
+        # val_norm[j] = mean_H( ‖W_UV @ c_j‖₂ )，归一化到均值≈1 防量纲溢出。
+        val_norm = None
+        if W_UV is not None:
+            # W_UV: [H, v_head_dim, R]; mid_latent: [B, n_mid, R]
+            # val_proj: [B, H, n_mid, v_head_dim]
+            val_proj = torch.einsum("bnr,hdr->bhnd", mid_latent, W_UV).float()
+            val_norm = val_proj.norm(dim=-1).mean(dim=1)              # [B, n_mid]
+            v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+            val_norm = val_norm / v_mean                              # 均值归一化到 1
+
+        # ── 主评分 ────────────────────────────────────────────────────────
+        if q_abs is not None:
+            # ── Query-Aware：因果 attention 列求和 × Value 范数（可选）───────
+            # 长序列保护：n_mid=32k 时全量矩阵 [B,H,32k,32k] fp32 ≈ 68 GB → OOM。
+            # 改为随机子采样 K 个 query 行，列求和是无偏估计，仅增加排序噪声。
+            # 内存：O(K×n) vs O(n²)；32k@K=512 ≈ 1 GB，128k@K=512 ≈ 4 GB。
+            q_mid = q_abs[:, :, n_sink : seq_len - n_recent, :]       # [B, H, n_mid, R]
+            K = min(self.latent_eviction_score_queries, n_mid)
+
+            if K < n_mid:
+                # 随机均匀采样 K 个 query 位置，sort 保持时序（因果掩码需要）
+                sample_pos = torch.randperm(n_mid, device=device)[:K].sort().values  # [K]
+                q_scored   = q_mid[:, :, sample_pos, :]                # [B, H, K, R]
+                # causal_mask[k, j] = True ↔ key j 在采样 query k 之后（应屏蔽）
+                causal_mask = (
+                    torch.arange(n_mid, device=device).unsqueeze(0)   # [1, n_mid]
+                    > sample_pos.unsqueeze(1)                           # [K, 1]
+                )  # [K, n_mid] bool
+            else:
+                q_scored    = q_mid                                    # 序列短，用全量
+                causal_mask = ~torch.tril(
+                    torch.ones(n_mid, n_mid, device=device, dtype=torch.bool)
+                )  # [n_mid, n_mid]: True = 上三角（key > query，屏蔽）
+
+            attn_logits = torch.matmul(
+                q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
+            ) * self.softmax_scale                                     # [B, H, K, n_mid]
+            attn_logits = attn_logits.masked_fill(
+                causal_mask[None, None], float("-inf")
+            )
+            attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
+            col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
+
+            if val_norm is not None:
+                # Value-Aware: 列和 × ‖W_UV @ c_j‖，再对 head 取均值
+                info_mid = (col_sum * val_norm.unsqueeze(1)).mean(dim=1)  # [B, n_mid]
+            else:
+                info_mid = col_sum.mean(dim=1)                         # [B, n_mid]
+        else:
+            # ── 统计 Fallback ──────────────────────────────────────────────
+            info_mid = info_all[:, n_sink : seq_len - n_recent].float()
+            if val_norm is not None:
+                info_mid = info_mid * val_norm
+
+        # ── Top-K 选中间段，拼合 Sink + 中间 + Recent ─────────────────────
+        mid_order    = info_mid.argsort(dim=-1, descending=True)[:, :n_mid_keep]
+        mid_keep_idx = (mid_order + n_sink).sort(dim=-1).values
+
+        sink_idx   = torch.arange(n_sink,              device=device).unsqueeze(0).expand(bsz, -1)
+        recent_idx = torch.arange(seq_len - n_recent, seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        keep_idx   = torch.cat([sink_idx, mid_keep_idx, recent_idx], dim=1).sort(dim=-1).values
+
+        evicted = seq_len - keep_idx.shape[1]
+        mode = ("value+query-aware" if (q_abs is not None and W_UV is not None) else
+                "query-aware"       if q_abs is not None else
+                "value+statistical" if W_UV  is not None else
+                "statistical")
         logger.debug(
-            f"Latent eviction [layer {self.layer_idx}]: "
-            f"chunk_size={seq_len}, kept={keep_k}, evicted={evicted} "
-            f"({evicted / seq_len * 100:.1f}%) | threshold={self.latent_eviction_threshold}"
+            f"Latent eviction [layer {self.layer_idx}] ({mode}): "
+            f"chunk={seq_len}, sink={n_sink}, recent={n_recent}, "
+            f"mid_kept={n_mid_keep}/{n_mid}, evicted={evicted} ({evicted/seq_len*100:.1f}%)"
         )
-        return keep_idx  # [B, keep_k]
+        return keep_idx
 
     def forward(
         self,
@@ -273,6 +392,21 @@ class DeepseekV2Attention(nn.Module):
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
         # k_pe : [B, 1, q_len, qk_rope_head_dim]  (RoPE applied)
 
+        # ── 权重吸收：提前拆分 kv_b_proj（q_abs 供 eviction scoring 使用）──────
+        # 必须在 cache update 前计算，否则 _compute_keep_indices 拿不到 q_abs。
+        # view 是零拷贝操作，不增加参数，不影响梯度。
+        W_kv = self.kv_b_proj.weight.view(
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        W_UK = W_kv[:, : self.qk_nope_head_dim, :]  # [H, qk_nope_head_dim, kv_lora_rank]
+        W_UV = W_kv[:, self.qk_nope_head_dim :, :]  # [H, v_head_dim,       kv_lora_rank]
+
+        # q_abs = q_nope @ W_UK  → [B, H, q_len, kv_lora_rank]
+        # 推导：q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
+        q_abs = torch.einsum("bhqd,hdr->bhqr", q_nope, W_UK)
+
         # ── Update cache: 存 latent（key_cache）和 k_pe（value_cache）───────
         # key_cache   ← c_kv_normed  [B, 1, S, kv_lora_rank=512]
         # value_cache ← k_pe         [B, 1, S, qk_rope_head_dim=64]
@@ -297,14 +431,43 @@ class DeepseekV2Attention(nn.Module):
             )
 
             if _is_first_prefill:
-                # [核心优化点 3：跨层对齐]
-                # Layer 0 计算驱逐索引并挂载到 Cache 对象上；其余层复用，
-                # 保证所有层丢弃完全相同位置的 Token。
-                if self.layer_idx == 0:
-                    keep_indices = self._compute_keep_indices(c_kv_normed)
+                # [核心优化点 3：决策层（Layer D）驱逐 + 溯源修剪]
+                # · Layer < D  → 稠密写入，等待决策层
+                # · Layer == D → 计算 keep_indices（Value-Aware Query-Aware），
+                #                同时回头修剪已写入的 Layer 0..D-1
+                # · Layer > D  → 复用 shared_keep_indices
+                # 改用 Layer 6 而非 Layer 0：实验表明 Layer 0 特征未稳定，
+                # Config-B PPL 退化严重；Layer 6 起与 Oracle 差距 ≤ 0.5 PPL。
+                D = self.latent_eviction_decision_layer
+
+                if self.layer_idx == D:
+                    # 传入 q_abs 和 W_UV 启用 Value-Aware Query-Aware 评分
+                    keep_indices = self._compute_keep_indices(
+                        c_kv_normed, q_abs=q_abs, W_UV=W_UV
+                    )
                     past_key_value.shared_keep_indices = keep_indices
-                else:
+
+                    # [核心优化点 3b：溯源修剪 Layer 0..D-1]
+                    # Layer D 算出索引后立即回头裁剪前面已写入的 cache。
+                    # 各层 key_cache / value_cache 此时存的是完整 prefill 长度，
+                    # 用同一份 keep_indices gather 即可对齐到相同物理长度。
+                    _ret_idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B,1,keep_k,1]
+                    for _prev in range(D):
+                        if len(past_key_value.key_cache) > _prev:
+                            _pl = past_key_value.key_cache[_prev]
+                            _pk = past_key_value.value_cache[_prev]
+                            past_key_value.key_cache[_prev]   = _pl.gather(
+                                2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1])
+                            )
+                            past_key_value.value_cache[_prev] = _pk.gather(
+                                2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1])
+                            )
+
+                elif self.layer_idx > D:
                     keep_indices = getattr(past_key_value, "shared_keep_indices", None)
+                else:
+                    # layer_idx < D：稠密，不驱逐
+                    keep_indices = None
 
                 if keep_indices is not None:
                     # [核心优化点 4：双轨同步切片（latent + k_pe 两条轨道）]
@@ -316,7 +479,7 @@ class DeepseekV2Attention(nn.Module):
                         2, idx.expand(-1, 1, -1, cached_kpe.shape[-1])
                     )  # [B, 1, keep_k, qk_rope_head_dim]
 
-                    # 强制覆写存储的 cache（驱逐在此发生）
+                    # 强制覆写当前层 cache（驱逐在此发生）
                     # 局部变量 cached_latent / cached_kpe 仍指向覆写前的完整张量，
                     # 当前 forward 的 attention 依然对全量 q_len token 计算；
                     # 裁剪后的 cache 仅供后续 decode 步骤使用。
@@ -331,27 +494,8 @@ class DeepseekV2Attention(nn.Module):
             cached_latent = c_kv_normed_4d  # [B, 1, q_len, kv_lora_rank]
             cached_kpe    = k_pe             # [B, 1, q_len, qk_rope_head_dim]
 
-        # ── 权重吸收：拆分 kv_b_proj ──────────────────────────────────────
-        # kv_b_proj.weight : [H*(qk_nope_head_dim + v_head_dim), kv_lora_rank]
-        #   W_UK [H, qk_nope_head_dim, kv_lora_rank]  latent → k_nope
-        #   W_UV [H, v_head_dim,       kv_lora_rank]  latent → v
-        W_kv = self.kv_b_proj.weight.view(
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        W_UK = W_kv[:, : self.qk_nope_head_dim, :]  # [H, qk_nope_head_dim, kv_lora_rank]
-        W_UV = W_kv[:, self.qk_nope_head_dim :, :]  # [H, v_head_dim,       kv_lora_rank]
-
-        # ── 吸收后的 Query ─────────────────────────────────────────────────
-        # q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
-        # 令 q_abs = q_nope @ W_UK，直接与 latent 做内积，不再展开 K。
-        # q_nope : [B, H, q_len, qk_nope_head_dim]
-        # W_UK   : [H, qk_nope_head_dim, kv_lora_rank]
-        # q_abs  : [B, H, q_len, kv_lora_rank]
-        q_abs = torch.einsum("bhqd,hdr->bhqr", q_nope, W_UK)
-
         # ── 注意力分数 ─────────────────────────────────────────────────────
+        # W_UK / W_UV / q_abs 已在 cache update 前计算完毕（见上方）。
         # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
         # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
         content_score = torch.matmul(q_abs, cached_latent.transpose(-1, -2))
