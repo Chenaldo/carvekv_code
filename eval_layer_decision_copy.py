@@ -107,17 +107,18 @@ KEEP_RATIO         = 0.70   # Top-K fraction of tokens to KEEP. Fixed → IDENTI
 EVICTION_WINDOW    = 4      # Neighbour-redundancy radius (CAUSAL: looks back only)
 MAX_SEQ_LEN        = 1024   # Context window per PPL chunk (tokens)
 STRIDE             = 512    # Sliding-window stride  (tokens evaluated/step)
-MAX_CHUNKS         = 200    # Cap on WikiText-2 chunks (None = full ~480 chunks)
-                            # 200 ≈ 103K tokens, sufficient for publication-quality PPL
+MAX_CHUNKS         = 200     # Cap on WikiText-2 chunks (None = full ~500 chunks)
 DTYPE              = torch.bfloat16
 
+# Candidate decision layers to sweep (which layer computes the shared eviction vector)
+SWEEP_LAYERS = [0, 1, 2, 4, 6, 8, 12, 16]
+
 # (id, human label, internal strategy key)
-CONFIGS = [
-    ("A", "Baseline",          "baseline"),
-    ("B", "Layer-0 Decision",  "layer_0"),
-    ("C", "Delayed Decision",  "layer_2"),
-    ("D", "Oracle",            "oracle"),
-]
+CONFIGS = (
+    [("A", "Baseline", "baseline")]
+    + [(f"L{L}", f"Layer-{L} Decision", f"layer_{L}") for L in SWEEP_LAYERS]
+    + [("D", "Oracle", "oracle")]
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -281,27 +282,20 @@ def resolve_eviction(
     if strategy == "baseline":
         return None, 1.0
 
-    # ── Config B: Layer 0 decides → all layers share ──────────────────────
-    if strategy == "layer_0":
-        if layer_idx == 0:
+    # ── Config layer_L: layer L (and all deeper layers) share one eviction vector
+    #    · layer_idx < L  → dense (no eviction)
+    #    · layer_idx == L → compute, cache, AND apply eviction
+    #    · layer_idx > L  → reuse cached vector
+    if strategy.startswith("layer_"):
+        L = int(strategy.split("_", 1)[1])
+        if layer_idx < L:
+            return None, 1.0
+        if layer_idx == L:
             ev, kf = _build_evict_vector(c_kv)
             state.evict_vector     = ev
             state.kept_frac_shared = kf
-        if state.evict_vector is None:
-            return None, 1.0
-        return state.evict_vector.to(c_kv.device), state.kept_frac_shared
-
-    # ── Config C: layers 0-1 dense; layer 2 computes for layers 3+ ───────
-    if strategy == "layer_2":
-        if layer_idx < 2:
-            return None, 1.0
-        if layer_idx == 2:
-            # Compute and store — but layer 2 itself stays dense
-            ev, kf = _build_evict_vector(c_kv)
-            state.evict_vector     = ev
-            state.kept_frac_shared = kf
-            return None, 1.0
-        # layer >= 3
+            return ev, kf
+        # layer_idx > L
         if state.evict_vector is None:
             return None, 1.0
         return state.evict_vector.to(c_kv.device), state.kept_frac_shared
@@ -588,47 +582,47 @@ def main():
         f"**Chunks**: {MAX_CHUNKS}"
     )
 
-    # ── Automatic interpretation ───────────────────────────────────────────
-    _, _, _, ppl_b, kept_b, _ = results[1]
-    _, _, _, ppl_c, kept_c, _ = results[2]
-    _, _, _, ppl_d, kept_d, _ = results[3]
+    # ── Automatic interpretation — layer-sweep summary ─────────────────────
+    # results[0]  = Baseline (A)
+    # results[1:-1] = sweep layers L0 … L_max
+    # results[-1] = Oracle (D)
+    ppl_oracle   = results[-1][3]
+    delta_oracle = ppl_oracle - baseline_ppl
+    sweep_results = results[1:-1]   # all layer_L configs
 
-    delta_b  = ppl_b - baseline_ppl
-    delta_c  = ppl_c - baseline_ppl
-    delta_d  = ppl_d - baseline_ppl
-    bc_gap   = abs(delta_b - delta_c)
-    bd_gap   = abs(delta_b - delta_d)
-    rel_bc   = bc_gap / max(abs(delta_b), 1e-6)
+    SWEET_SPOT_TOL = 0.5   # gap to Oracle considered "good enough"
 
     print("\n" + "─" * 72)
-    print("  KEY FINDINGS\n")
-    print(f"  Δ PPL  A→B  (Layer-0 Decision vs Baseline) : {delta_b:+.4f}")
-    print(f"  Δ PPL  A→C  (Delayed Decision vs Baseline) : {delta_c:+.4f}")
-    print(f"  Δ PPL  A→D  (Oracle vs Baseline)           : {delta_d:+.4f}")
-    print(f"  |B−C|  (Layer-0 vs Delayed)                : {bc_gap:.4f}")
-    print(f"  |B−D|  (Layer-0 vs Oracle)                 : {bd_gap:.4f}")
+    print("  KEY FINDINGS  —  Layer-Sweep Gap vs Oracle\n")
+    print(f"  Baseline PPL (A) : {baseline_ppl:.4f}")
+    print(f"  Oracle   PPL (D) : {ppl_oracle:.4f}  (Δ vs A = {delta_oracle:+.4f})\n")
+    print(f"  {'Layer':>7}  {'PPL':>8}  {'Δ vs A':>9}  {'Gap vs Oracle':>14}")
+    print(f"  {'─'*7}  {'─'*8}  {'─'*9}  {'─'*14}")
+
+    sweet_spot_layer = None
+    for cfg_id, label, strategy, ppl, kept, elapsed in sweep_results:
+        delta_vs_a    = ppl - baseline_ppl
+        gap_vs_oracle = ppl - ppl_oracle
+        marker = ""
+        if gap_vs_oracle <= SWEET_SPOT_TOL and sweet_spot_layer is None:
+            sweet_spot_layer = cfg_id
+            marker = "  ← Sweet Spot ✓"
+        print(
+            f"  {cfg_id:>7}  {ppl:>8.4f}  {delta_vs_a:>+9.4f}  {gap_vs_oracle:>+14.4f}{marker}"
+        )
+
     print()
-
-    if rel_bc < 0.10:
+    if sweet_spot_layer is not None:
         print(
-            "  ✓  B ≈ C  (|B−C| < 10% of B's degradation) — "
-            "features settle already at Layer 0; delaying yields no benefit."
+            f"  ✓  Sweet Spot: {sweet_spot_layer} — earliest layer within "
+            f"{SWEET_SPOT_TOL} PPL of Oracle.\n"
+            f"     Features are sufficiently settled by this layer;"
+            f" using it as the shared decision layer is recommended."
         )
     else:
         print(
-            f"  △  B and C differ by {bc_gap:.4f} PPL — "
-            "there may be incremental benefit to using a later decision layer."
-        )
-
-    if bd_gap / max(abs(delta_b), 1e-6) < 0.15:
-        print(
-            "  ✓  B ≈ D  (Layer-0 within 15% of Oracle) — "
-            "cross-layer shared decision approaches the independent-oracle ceiling."
-        )
-    else:
-        print(
-            f"  △  B lags D by {bd_gap:.4f} PPL — "
-            "per-layer independent decisions provide measurable additional benefit."
+            f"  △  No sweep layer reached within {SWEET_SPOT_TOL} PPL of Oracle.\n"
+            f"     Consider sweeping deeper layers or increasing KEEP_RATIO."
         )
 
     print("─" * 72)

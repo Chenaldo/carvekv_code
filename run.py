@@ -247,22 +247,46 @@ def measure_prefill_cache(model, tokenizer, text: str):
     input_ids = inputs.input_ids.to(next(model.parameters()).device)
     input_len = input_ids.shape[1]
 
-    cache = DynamicCache()
     with torch.no_grad():
-        model(input_ids=input_ids, past_key_values=cache, use_cache=True)
+        outputs = model(input_ids=input_ids, use_cache=True)
 
-    # 读取各层实际写入了多少 token
-    cached_lens = [
-        cache.key_cache[i].shape[2]
-        for i in range(len(cache.key_cache))
-    ]
+    cache = outputs.past_key_values
+    num_layers = model.config.num_hidden_layers
+
+    # 兼容各 transformers 版本的 cache 内部结构
+    if cache is None:
+        cached_lens = [0] * num_layers
+    elif hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
+        # DynamicCache (transformers 4.36~4.47)
+        cached_lens = [cache.key_cache[i].shape[2] for i in range(len(cache.key_cache))]
+    elif isinstance(cache, (list, tuple)) and len(cache) > 0:
+        # Legacy tuple-of-tuples: ((k0,v0), (k1,v1), ...)
+        cached_lens = [cache[i][0].shape[2] for i in range(len(cache))]
+    else:
+        # 公共 API fallback
+        try:
+            cached_lens = [cache.get_seq_length(i) for i in range(num_layers)]
+        except Exception:
+            cached_lens = [cache.get_seq_length()] * num_layers
+
     return input_len, cached_lens
 
 
-def print_cache_stats(label: str, input_len: int, cached_lens: list):
+def print_cache_stats(label: str, input_len: int, cached_lens: list,
+                      model=None):
     avg   = sum(cached_lens) / len(cached_lens)
     ratio = avg / input_len if input_len > 0 else 1.0
     saved = 1.0 - ratio
+
+    # 检测是否为 Weight-Absorption 版（cache 存 latent，dims=576，而非扩展 KV）
+    # 通过对比 kv_lora_rank + qk_rope_head_dim vs q_head_dim * num_heads 来判断
+    latent_dims = None
+    expanded_dims = None
+    if model is not None:
+        cfg = model.config
+        latent_dims   = getattr(cfg, "kv_lora_rank", 0) + getattr(cfg, "qk_rope_head_dim", 0)
+        expanded_dims = (getattr(cfg, "qk_nope_head_dim", 0) +
+                         getattr(cfg, "qk_rope_head_dim", 0)) * getattr(cfg, "num_attention_heads", 1)
 
     sep = "─" * 58
     print(f"\n┌{sep}┐")
@@ -270,8 +294,13 @@ def print_cache_stats(label: str, input_len: int, cached_lens: list):
     print(f"├{sep}┤")
     print(f"│  输入 tokens（prefill 长度）  : {input_len:<28}│")
     print(f"│  各层平均缓存 tokens          : {avg:<28.1f}│")
-    print(f"│  缓存保留率                   : {ratio:<28.1%}│")
-    print(f"│  节省显存比例                 : {saved:<28.1%}│")
+    print(f"│  缓存保留率（eviction）        : {ratio:<28.1%}│")
+    print(f"│  节省显存比例（eviction）      : {saved:<28.1%}│")
+    if latent_dims and expanded_dims and latent_dims < expanded_dims:
+        dim_ratio = latent_dims / expanded_dims
+        total_saved = 1.0 - ratio * dim_ratio
+        print(f"│  per-token 维度压缩           : {latent_dims} / {expanded_dims} dims = {dim_ratio:.1%}{'':14}│")
+        print(f"│  综合节省（eviction × 维度）  : {total_saved:<28.1%}│")
     print(f"│  层数 / min / max             : {len(cached_lens)} / {min(cached_lens)} / {max(cached_lens):<18}│")
     print(f"└{sep}┘")
 
@@ -282,15 +311,15 @@ def compare_compression(model, tokenizer, prompt: str):
 
     model.configure_latent_eviction(enabled=False)
     input_len, lens_base = measure_prefill_cache(model, tokenizer, prompt)
-    print_cache_stats("无驱逐（基准）", input_len, lens_base)
+    print_cache_stats("无驱逐（基准）", input_len, lens_base, model)
 
     model.configure_latent_eviction(enabled=True, threshold=0.2, window=EVICTION_WINDOW)
     _, lens_lo = measure_prefill_cache(model, tokenizer, prompt)
-    print_cache_stats("保守驱逐（threshold=0.2）", input_len, lens_lo)
+    print_cache_stats("保守驱逐（threshold=0.2）", input_len, lens_lo, model)
 
     model.configure_latent_eviction(enabled=True, threshold=0.3, window=EVICTION_WINDOW)
     _, lens_hi = measure_prefill_cache(model, tokenizer, prompt)
-    print_cache_stats("标准驱逐（threshold=0.3）", input_len, lens_hi)
+    print_cache_stats("标准驱逐（threshold=0.3）", input_len, lens_hi, model)
 
     model.configure_latent_eviction(enabled=False)
 

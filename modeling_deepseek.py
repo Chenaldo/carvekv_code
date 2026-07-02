@@ -854,6 +854,13 @@ class DeepseekV2Attention(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        # ----- 预计算 kv_b_proj 的权重分割（weight absorption 用）-----
+        # 在 __init__ 里做一次，避免每次 forward 都重新 view。
+        # 注意：这是 view（零拷贝），不新增参数，不影响梯度。
+        # W_UK [H, qk_nope_head_dim, kv_lora_rank] : latent → k_nope
+        # W_UV [H, v_head_dim,       kv_lora_rank] : latent → v
+        # （实际拆分在 forward 里执行，因为 kv_b_proj 的权重在 __init__ 结束后才确定）
+
         # ----- Latent Eviction Config (MLA KV Cache Compression Research) -----
         # Enable latent-based token eviction during prefill to compress the KV cache.
         # Each token's c_t^{KV} latent is scored by compute_latent_info_score (a blend
@@ -977,177 +984,204 @@ class DeepseekV2Attention(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Weight-Absorption MLA Forward — stores compressed latent in KV cache.
+
+        Cache layout (per layer):
+            key_cache   [B, 1, S, kv_lora_rank]     ← kv_a_layernorm(c_t^{KV})
+            value_cache [B, 1, S, qk_rope_head_dim]  ← RoPE-encoded k_t^R
+
+        Attention via weight absorption (no K/V expansion at inference time):
+            content_score = q_absorbed @ cached_latent^T
+            where q_absorbed = einsum(q_nope, W_UK)    推导：
+              q_nope^T k_nope = q_nope^T (W_UK c) = (W_UK^T q_nope)^T c
+
+            rope_score = q_pe @ cached_kpe^T
+
+            output = einsum(attn @ cached_latent, W_UV)
+
+        Memory: 576 floats/token vs 4096 (expanded K/V) — ~7× smaller per layer.
+        """
         if "padding_mask" in kwargs:
             warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+                "Please make sure use `attention_mask` instead."
             )
         bsz, q_len, _ = hidden_states.size()
 
+        # ── Query projection ───────────────────────────────────────────────
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
-            ##将hidden_size h_t 映射到q_lora_rank维度，见thinking 1 2 式
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-        ##输入C_t^q,一次性算完，分割出q_t^c和q_t^R
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        ###输入h_t,一次性算完，分割出k_t^R和Latent(C_t^kv),见thinking 3 式
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        compressed_kv, k_pe = torch.split(
-            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # q_nope : [B, H, q_len, qk_nope_head_dim]
+        # q_pe   : [B, H, q_len, qk_rope_head_dim]
 
-        ###将Latent(C_t^kv)输入一次性算完，解压分割成k_t^c和v_t^c,见thinking 4 式
-        kv = (
-            self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(1, 2)
-        )
+        # ── KV compression → latent + k_pe ────────────────────────────────
+        raw = self.kv_a_proj_with_mqa(hidden_states)
+        c_kv, k_pe_raw = torch.split(raw, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        c_kv_normed = self.kv_a_layernorm(c_kv)                       # [B, q_len, kv_lora_rank]
+        k_pe = k_pe_raw.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        # k_pe : [B, 1, q_len, qk_rope_head_dim]
 
-        k_nope, value_states = torch.split(
-            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
-        kv_seq_len = value_states.shape[-2]
+        # ── kv_seq_len & RoPE ──────────────────────────────────────────────
+        if self.layer_idx is None and past_key_value is not None:
+            raise ValueError(
+                f"The cache structure has changed since version v4.36. If you are using "
+                f"{self.__class__.__name__} for auto-regressive decoding with k/v caching, "
+                "please make sure to initialize the attention class with a layer index."
+            )
+
+        kv_seq_len = q_len
         if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        # With latent eviction the physical cache (hence kv_seq_len) is SHORTER than
-        # the true sequence length, yet position_ids still carry TRUE absolute
-        # positions. The rotary tables must be long enough to be indexed by those
-        # true positions, otherwise cos[position_ids] goes out of bounds.
-        rotary_seq_len = kv_seq_len
+            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
-        ##“欺骗”旋转位置编码模块
+        # 驱逐后物理 cache 短于真实序列长度；position_ids 仍携带真实绝对位置，
+        # 须把 rotary 表扩展到真实最大位置，否则 cos[position_ids] 越界。
+        rotary_seq_len = kv_seq_len
         if self.latent_eviction and position_ids is not None:
             rotary_seq_len = max(rotary_seq_len, int(position_ids.max()) + 1)
-        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
-        ##施加 RoPE 位置编码
+        cos, sin = self.rotary_emb(k_pe, seq_len=rotary_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        # k_pe : [B, 1, q_len, qk_rope_head_dim]  (RoPE applied)
 
+        # ── Update cache: 存 latent（key_cache）和 k_pe（value_cache）───────
+        # key_cache   ← c_kv_normed  [B, 1, S, kv_lora_rank=512]
+        # value_cache ← k_pe         [B, 1, S, qk_rope_head_dim=64]
+        # 两者合计 576 维/token，比展开 K/V 的 4096 维节省约 7×。
+        c_kv_normed_4d = c_kv_normed.unsqueeze(1)  # [B, 1, q_len, kv_lora_rank]
 
-        ##拼接完整 Q 和 K
-        ##query_states = [q_nope | q_pe]                            # 公式(40)
-        ##key_states   = [k_nope | k_pe]                              公式(44)
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            cache_kwargs = {"sin": sin, "cos": cos}
 
-            # 在 update 之前判断是否属于首次 prefill（本层 cache 尚为空）
-            # 必须在 update 前检查：update 之后本层 cache 必然非空，检查会失效
+            # 必须在 update 前检查：update 后本层 cache 必然非空，检查失效
             _is_first_prefill = (
                 q_len > 1
                 and self.latent_eviction
-                and not (
-                    len(past_key_value.key_cache) > self.layer_idx
-                    and past_key_value.key_cache[self.layer_idx].numel() > 0
-                )
+                and past_key_value.get_seq_length(self.layer_idx) == 0
             )
 
-            # [核心优化点 2：区分 Prefill 与 Decode]
-            # 先无条件将完整 token 写入 Cache。Decode 阶段（q_len==1）或
-            # chunked-prefill 续写阶段到此即结束，不触发任何评分/切片，
-            # 彻底杜绝 per-token 非连续内存拷贝导致的 tokens/s 下降。
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
+            # update() 拼接 past + current，返回完整序列的 latent 和 k_pe
+            # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]
+            # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
+            cached_latent, cached_kpe = past_key_value.update(
+                c_kv_normed_4d, k_pe, self.layer_idx, cache_kwargs
             )
 
             if _is_first_prefill:
-                # [核心优化点 3：跨层对齐 (Cross-layer Alignment)]
-                # Layer 0 计算驱逐索引并挂载到 Cache 对象上；其余层直接复用，
-                # 保证所有层丢弃的是完全相同位置的 Token，DynamicCache
-                # 各层长度始终一致，避免后续 decode 因层间长度不一而崩溃。
+                # [核心优化点 3：跨层对齐]
+                # Layer 0 计算驱逐索引并挂载到 Cache 对象上；其余层复用，
+                # 保证所有层丢弃完全相同位置的 Token。
                 if self.layer_idx == 0:
-                    keep_indices = self._compute_keep_indices(compressed_kv)
+                    keep_indices = self._compute_keep_indices(c_kv_normed)
                     past_key_value.shared_keep_indices = keep_indices
                 else:
                     keep_indices = getattr(past_key_value, "shared_keep_indices", None)
 
                 if keep_indices is not None:
-                    # [核心优化点 4：双轨同步切片]
-                    # 用同一份 keep_indices 同时对 key_cache 和 value_cache 做 gather，
-                    # 确保 K/V 位置完全对齐，避免错位导致注意力计算错误。
+                    # [核心优化点 4：双轨同步切片（latent + k_pe 两条轨道）]
                     idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B, 1, keep_k, 1]
-                    trimmed_key = key_states.gather(
-                        2, idx.expand(-1, self.num_heads, -1, key_states.shape[-1])
-                    )   # [B, H, keep_k, q_head_dim]
-                    trimmed_val = value_states.gather(
-                        2, idx.expand(-1, self.num_heads, -1, value_states.shape[-1])
-                    )   # [B, H, keep_k, v_head_dim]
+                    trimmed_latent = cached_latent.gather(
+                        2, idx.expand(-1, 1, -1, cached_latent.shape[-1])
+                    )  # [B, 1, keep_k, kv_lora_rank]
+                    trimmed_kpe = cached_kpe.gather(
+                        2, idx.expand(-1, 1, -1, cached_kpe.shape[-1])
+                    )  # [B, 1, keep_k, qk_rope_head_dim]
 
-                    # 强制覆写底层 Cache（驱逐在此发生）
-                    past_key_value.key_cache[self.layer_idx]   = trimmed_key
-                    past_key_value.value_cache[self.layer_idx] = trimmed_val
+                    # 强制覆写存储的 cache（驱逐在此发生）
+                    # 局部变量 cached_latent / cached_kpe 仍指向覆写前的完整张量，
+                    # 当前 forward 的 attention 依然对全量 q_len token 计算；
+                    # 裁剪后的 cache 仅供后续 decode 步骤使用。
+                    past_key_value.key_cache[self.layer_idx]   = trimmed_latent
+                    past_key_value.value_cache[self.layer_idx] = trimmed_kpe
 
                     # [核心优化点 5：修复 DynamicCache 内置状态]
-                    # update() 在 layer 0 时已将 _seen_tokens 加上了 q_len，
-                    # 在最后一层统一修正为实际保留数量，防止多层分别写引发竞争。
                     if self.layer_idx == self.config.num_hidden_layers - 1:
-                        past_key_value._seen_tokens = trimmed_key.shape[2]
+                        past_key_value._seen_tokens = trimmed_latent.shape[2]
+        else:
+            # 无 cache：只用当前 q_len 个 token
+            cached_latent = c_kv_normed_4d  # [B, 1, q_len, kv_lora_rank]
+            cached_kpe    = k_pe             # [B, 1, q_len, qk_rope_head_dim]
 
-                    # key_states / value_states 保持完整 [B, H, q_len, D]，
-                    # 当前 prefill 对全量 token 做注意力，保证 intra-chunk 注意力精度；
-                    # 已剪枝的 Cache 仅作用于后续 Decode（更短 KV 序列 → 更低显存）。
-
-        ##计算注意力权重attn_weights = Q @ K^T * softmax_scale
-        attn_weights = (
-            torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
+        # ── 权重吸收：拆分 kv_b_proj ──────────────────────────────────────
+        # kv_b_proj.weight : [H*(qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        #   W_UK [H, qk_nope_head_dim, kv_lora_rank]  latent → k_nope
+        #   W_UV [H, v_head_dim,       kv_lora_rank]  latent → v
+        W_kv = self.kv_b_proj.weight.view(
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
         )
+        W_UK = W_kv[:, : self.qk_nope_head_dim, :]  # [H, qk_nope_head_dim, kv_lora_rank]
+        W_UV = W_kv[:, self.qk_nope_head_dim :, :]  # [H, v_head_dim,       kv_lora_rank]
+
+        # ── 吸收后的 Query ─────────────────────────────────────────────────
+        # q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
+        # 令 q_abs = q_nope @ W_UK，直接与 latent 做内积，不再展开 K。
+        # q_nope : [B, H, q_len, qk_nope_head_dim]
+        # W_UK   : [H, qk_nope_head_dim, kv_lora_rank]
+        # q_abs  : [B, H, q_len, kv_lora_rank]
+        q_abs = torch.einsum("bhqd,hdr->bhqr", q_nope, W_UK)
+
+        # ── 注意力分数 ─────────────────────────────────────────────────────
+        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
+        # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
+        content_score = torch.matmul(q_abs, cached_latent.transpose(-1, -2))
+        rope_score    = torch.matmul(q_pe,  cached_kpe.transpose(-1, -2))
+        attn_weights  = (content_score + rope_score) * self.softmax_scale
+        # [B, H, q_len, kv_seq_len]
+
+        kv_seq_len = cached_latent.shape[2]  # 以实际 cached_latent 为准
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, "
+                f"but is {attn_weights.size()}"
             )
         assert attention_mask is not None
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, "
+                    f"but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
+        ).to(q_nope.dtype)
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.attention_dropout, training=self.training
         )
-        ##加权聚合 V
-        attn_output = torch.matmul(attn_weights, value_states)
+
+        # ── 输出：通过吸收后的 V 权重聚合 ─────────────────────────────────
+        # output = attn @ v = attn @ (W_UV c) = (attn @ c) @ W_UV^T
+        # 先对 latent 做加权求和，再用 W_UV 投影一次，不展开所有 S 个 v 向量。
+        # attn_weights  : [B, H, q_len, kv_seq_len]
+        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
+        weighted_latent = torch.matmul(attn_weights, cached_latent)
+        # [B, H, q_len, kv_lora_rank]
+        attn_output = torch.einsum("bhqr,hdr->bhqd", weighted_latent, W_UV)
+        # [B, H, q_len, v_head_dim]
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
-                f" {attn_output.size()}"
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, "
+                f"but is {attn_output.size()}"
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-
-        ##输出投影
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->DeepseekV2
@@ -1219,7 +1253,7 @@ class DeepseekV2FlashAttention2(DeepseekV2Attention):
 
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         # See eager forward: extend rotary tables to cover TRUE positions when
         # eviction shrinks the physical cache below the real sequence length.
@@ -1730,7 +1764,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
