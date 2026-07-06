@@ -94,6 +94,10 @@ class DeepseekV2Attention(nn.Module):
         # the cache write. The number evicted is content-adaptive, NOT a fixed ratio.
         self.latent_eviction = True              # Set True to enable eviction during prefill
         self.latent_eviction_threshold = 0.3     # Drop tokens with info score below this
+                                                 # (only used when keep_ratio is None)
+        self.latent_eviction_keep_ratio = 0.70   # If set, fixes compression rate regardless
+                                                 # of threshold; avoids weight sensitivity.
+                                                 # Set to None to use adaptive threshold.
         self.latent_eviction_window = 4          # Neighbour radius for redundancy detection
         # Eviction is intentionally restricted to the ONE-SHOT prefill pass. During
         # autoregressive decode the cache is APPEND-ONLY: no scoring, no top-k, no
@@ -180,6 +184,86 @@ class DeepseekV2Attention(nn.Module):
             .contiguous()
         )
 
+
+def compute_latent_info_score(
+    compressed_kv: torch.Tensor,
+    window: int = 4,
+    w_norm: float = 0.4,
+    w_entropy: float = 0.3,
+    w_variance: float = 0.3,
+    w_redundancy: float = 0.5,
+) -> torch.Tensor:
+    """
+    Compute a composite *information score* for each latent KV vector (c_t^{KV}).
+
+    Instead of a single metric, this blends several complementary signals so that
+    a token is considered low-information if it is weak across the board OR is
+    largely a duplicate of its neighbours. Tokens whose score falls below a
+    threshold can then be evicted before the cache write ("read, forget the
+    filler, remember the key parts").
+
+    Signals (each min-max normalized to [0, 1] across the sequence):
+        - L2 norm            : magnitude of the latent  (larger = richer)
+        - negative entropy   : peakedness of softmax(c) (sharper = more specific)
+        - per-dim variance   : spread across dimensions  (flatter = more redundant)
+    Penalty:
+        - neighbour redundancy: max cosine similarity to tokens within `window`
+                                (high similarity = duplicate = less worth keeping)
+
+    Composite:
+        info = w_norm*norm + w_entropy*neg_entropy + w_variance*variance
+               - w_redundancy*redundancy
+    The positive weights are intended to sum to 1.0, so the informative part lies
+    in [0, 1] and the redundancy penalty pulls duplicates down toward (and below) 0.
+
+    Args:
+        compressed_kv: [B, S, kv_lora_rank]  latent vectors after kv_a_proj_with_mqa
+        window:        neighbour radius for redundancy detection
+        w_norm/w_entropy/w_variance: weights of the informativeness signals
+        w_redundancy:  weight of the neighbour-redundancy penalty
+
+    Returns:
+        info: [B, S]  composite information score, higher = more worth keeping
+    """
+    x = compressed_kv.float()
+    bsz, seq_len, _ = x.shape
+
+    # --- Signal 1: L2 norm (magnitude / richness) ---
+    norm = x.norm(dim=-1)                                      # [B, S]
+
+    # --- Signal 2: negative normalized entropy (distribution peakedness) ---
+    prob = F.softmax(x, dim=-1)
+    entropy = -(prob * (prob + 1e-10).log()).sum(dim=-1)      # [B, S]
+    neg_entropy = -entropy                                     # peaked = more info
+
+    # --- Signal 3: per-dimension variance (spread / non-flatness) ---
+    variance = x.var(dim=-1)                                   # [B, S]
+
+    # --- Penalty: neighbour redundancy via local cosine similarity ---
+    # Compare each token only with up to `window` neighbours on each side using
+    # cheap shifted dot-products (O(S * window * D)), avoiding a full S x S matrix.
+    x_unit = F.normalize(x, dim=-1)                            # [B, S, D]
+    redundancy = torch.zeros(bsz, seq_len, device=x.device, dtype=x.dtype)
+    for offset in range(1, max(1, window) + 1):
+        if offset >= seq_len:
+            break
+        # cosine similarity between token t and token (t - offset)
+        sim = (x_unit[:, offset:, :] * x_unit[:, :-offset, :]).sum(dim=-1)  # [B, S-offset]
+        # redundancy is symmetric: both tokens in the pair are "duplicates"
+        redundancy[:, offset:] = torch.maximum(redundancy[:, offset:], sim)
+        redundancy[:, :-offset] = torch.maximum(redundancy[:, :-offset], sim)
+
+    # --- Composite information score ---
+    info = (
+        w_norm * _robust_normalize(norm)
+        + w_entropy * _robust_normalize(neg_entropy)
+        + w_variance * _robust_normalize(variance)
+        - w_redundancy * _robust_normalize(redundancy)
+    )
+    return info                                               # [B, S]
+
+
+
     def _compute_keep_indices(
         self,
         compressed_kv: torch.Tensor,
@@ -224,11 +308,19 @@ class DeepseekV2Attention(nn.Module):
         n_recent = min(self.latent_eviction_recent_tokens, max(0, seq_len - n_sink))
         n_mid    = seq_len - n_sink - n_recent
 
-        # ── 用统计阈值估算总 keep_k（自适应驱逐量，与主评分无关）────────────
-        info_all    = compute_latent_info_score(compressed_kv, window=self.latent_eviction_window)
-        keep_mask   = info_all >= self.latent_eviction_threshold
-        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)
-        keep_k      = int(keep_counts.max().item())
+        # ── keep_k 确定：固定压缩率优先，退而使用统计阈值 ────────────────
+        # 固定压缩率（latent_eviction_keep_ratio 不为 None）完全绕开权重问题：
+        # 4 个统计权重只影响 statistical fallback 的排名，不再影响 budget。
+        # 统计阈值（latent_eviction_threshold）是 fallback，权重敏感度高，仅在
+        # keep_ratio=None 时使用（适合需要内容自适应压缩率的场景）。
+        if self.latent_eviction_keep_ratio is not None:
+            keep_k   = max(1, int(round(seq_len * self.latent_eviction_keep_ratio)))
+            info_all = None   # 不需要统计评分来确定 budget
+        else:
+            info_all    = compute_latent_info_score(compressed_kv, window=self.latent_eviction_window)
+            keep_mask   = info_all >= self.latent_eviction_threshold
+            keep_counts = keep_mask.sum(dim=-1).clamp(min=1)
+            keep_k      = int(keep_counts.max().item())
         keep_k      = max(keep_k, n_sink + n_recent + 1)  # sink + recent 必须全留
         keep_k      = min(keep_k, seq_len)
         n_mid_keep  = max(0, keep_k - n_sink - n_recent)
@@ -294,6 +386,11 @@ class DeepseekV2Attention(nn.Module):
                 info_mid = col_sum.mean(dim=1)                         # [B, n_mid]
         else:
             # ── 统计 Fallback ──────────────────────────────────────────────
+            # keep_ratio 模式下 info_all 为 None，此时才按需计算
+            if info_all is None:
+                info_all = compute_latent_info_score(
+                    compressed_kv, window=self.latent_eviction_window
+                )
             info_mid = info_all[:, n_sink : seq_len - n_recent].float()
             if val_norm is not None:
                 info_mid = info_mid * val_norm

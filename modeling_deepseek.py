@@ -695,82 +695,6 @@ def _robust_normalize(t: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(z)
 
 
-def compute_latent_info_score(
-    compressed_kv: torch.Tensor,
-    window: int = 4,
-    w_norm: float = 0.4,
-    w_entropy: float = 0.3,
-    w_variance: float = 0.3,
-    w_redundancy: float = 0.5,
-) -> torch.Tensor:
-    """
-    Compute a composite *information score* for each latent KV vector (c_t^{KV}).
-
-    Instead of a single metric, this blends several complementary signals so that
-    a token is considered low-information if it is weak across the board OR is
-    largely a duplicate of its neighbours. Tokens whose score falls below a
-    threshold can then be evicted before the cache write ("read, forget the
-    filler, remember the key parts").
-
-    Signals (each min-max normalized to [0, 1] across the sequence):
-        - L2 norm            : magnitude of the latent  (larger = richer)
-        - negative entropy   : peakedness of softmax(c) (sharper = more specific)
-        - per-dim variance   : spread across dimensions  (flatter = more redundant)
-    Penalty:
-        - neighbour redundancy: max cosine similarity to tokens within `window`
-                                (high similarity = duplicate = less worth keeping)
-
-    Composite:
-        info = w_norm*norm + w_entropy*neg_entropy + w_variance*variance
-               - w_redundancy*redundancy
-    The positive weights are intended to sum to 1.0, so the informative part lies
-    in [0, 1] and the redundancy penalty pulls duplicates down toward (and below) 0.
-
-    Args:
-        compressed_kv: [B, S, kv_lora_rank]  latent vectors after kv_a_proj_with_mqa
-        window:        neighbour radius for redundancy detection
-        w_norm/w_entropy/w_variance: weights of the informativeness signals
-        w_redundancy:  weight of the neighbour-redundancy penalty
-
-    Returns:
-        info: [B, S]  composite information score, higher = more worth keeping
-    """
-    x = compressed_kv.float()
-    bsz, seq_len, _ = x.shape
-
-    # --- Signal 1: L2 norm (magnitude / richness) ---
-    norm = x.norm(dim=-1)                                      # [B, S]
-
-    # --- Signal 2: negative normalized entropy (distribution peakedness) ---
-    prob = F.softmax(x, dim=-1)
-    entropy = -(prob * (prob + 1e-10).log()).sum(dim=-1)      # [B, S]
-    neg_entropy = -entropy                                     # peaked = more info
-
-    # --- Signal 3: per-dimension variance (spread / non-flatness) ---
-    variance = x.var(dim=-1)                                   # [B, S]
-
-    # --- Penalty: neighbour redundancy via local cosine similarity ---
-    # Compare each token only with up to `window` neighbours on each side using
-    # cheap shifted dot-products (O(S * window * D)), avoiding a full S x S matrix.
-    x_unit = F.normalize(x, dim=-1)                            # [B, S, D]
-    redundancy = torch.zeros(bsz, seq_len, device=x.device, dtype=x.dtype)
-    for offset in range(1, max(1, window) + 1):
-        if offset >= seq_len:
-            break
-        # cosine similarity between token t and token (t - offset)
-        sim = (x_unit[:, offset:, :] * x_unit[:, :-offset, :]).sum(dim=-1)  # [B, S-offset]
-        # redundancy is symmetric: both tokens in the pair are "duplicates"
-        redundancy[:, offset:] = torch.maximum(redundancy[:, offset:], sim)
-        redundancy[:, :-offset] = torch.maximum(redundancy[:, :-offset], sim)
-
-    # --- Composite information score ---
-    info = (
-        w_norm * _robust_normalize(norm)
-        + w_entropy * _robust_normalize(neg_entropy)
-        + w_variance * _robust_normalize(variance)
-        - w_redundancy * _robust_normalize(redundancy)
-    )
-    return info                                               # [B, S]
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->DeepseekV2
@@ -954,6 +878,85 @@ class DeepseekV2Attention(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
+
+
+def compute_latent_info_score(
+    compressed_kv: torch.Tensor,
+    window: int = 4,
+    w_norm: float = 0.4,
+    w_entropy: float = 0.3,
+    w_variance: float = 0.3,
+    w_redundancy: float = 0.5,
+) -> torch.Tensor:
+    """
+    Compute a composite *information score* for each latent KV vector (c_t^{KV}).
+
+    Instead of a single metric, this blends several complementary signals so that
+    a token is considered low-information if it is weak across the board OR is
+    largely a duplicate of its neighbours. Tokens whose score falls below a
+    threshold can then be evicted before the cache write ("read, forget the
+    filler, remember the key parts").
+
+    Signals (each min-max normalized to [0, 1] across the sequence):
+        - L2 norm            : magnitude of the latent  (larger = richer)
+        - negative entropy   : peakedness of softmax(c) (sharper = more specific)
+        - per-dim variance   : spread across dimensions  (flatter = more redundant)
+    Penalty:
+        - neighbour redundancy: max cosine similarity to tokens within `window`
+                                (high similarity = duplicate = less worth keeping)
+
+    Composite:
+        info = w_norm*norm + w_entropy*neg_entropy + w_variance*variance
+               - w_redundancy*redundancy
+    The positive weights are intended to sum to 1.0, so the informative part lies
+    in [0, 1] and the redundancy penalty pulls duplicates down toward (and below) 0.
+
+    Args:
+        compressed_kv: [B, S, kv_lora_rank]  latent vectors after kv_a_proj_with_mqa
+        window:        neighbour radius for redundancy detection
+        w_norm/w_entropy/w_variance: weights of the informativeness signals
+        w_redundancy:  weight of the neighbour-redundancy penalty
+
+    Returns:
+        info: [B, S]  composite information score, higher = more worth keeping
+    """
+    x = compressed_kv.float()
+    bsz, seq_len, _ = x.shape
+
+    # --- Signal 1: L2 norm (magnitude / richness) ---
+    norm = x.norm(dim=-1)                                      # [B, S]
+
+    # --- Signal 2: negative normalized entropy (distribution peakedness) ---
+    prob = F.softmax(x, dim=-1)
+    entropy = -(prob * (prob + 1e-10).log()).sum(dim=-1)      # [B, S]
+    neg_entropy = -entropy                                     # peaked = more info
+
+    # --- Signal 3: per-dimension variance (spread / non-flatness) ---
+    variance = x.var(dim=-1)                                   # [B, S]
+
+    # --- Penalty: neighbour redundancy via local cosine similarity ---
+    # Compare each token only with up to `window` neighbours on each side using
+    # cheap shifted dot-products (O(S * window * D)), avoiding a full S x S matrix.
+    x_unit = F.normalize(x, dim=-1)                            # [B, S, D]
+    redundancy = torch.zeros(bsz, seq_len, device=x.device, dtype=x.dtype)
+    for offset in range(1, max(1, window) + 1):
+        if offset >= seq_len:
+            break
+        # cosine similarity between token t and token (t - offset)
+        sim = (x_unit[:, offset:, :] * x_unit[:, :-offset, :]).sum(dim=-1)  # [B, S-offset]
+        # redundancy is symmetric: both tokens in the pair are "duplicates"
+        redundancy[:, offset:] = torch.maximum(redundancy[:, offset:], sim)
+        redundancy[:, :-offset] = torch.maximum(redundancy[:, :-offset], sim)
+
+    # --- Composite information score ---
+    info = (
+        w_norm * _robust_normalize(norm)
+        + w_entropy * _robust_normalize(neg_entropy)
+        + w_variance * _robust_normalize(variance)
+        - w_redundancy * _robust_normalize(redundancy)
+    )
+    return info                                               # [B, S]
+
 
     def _compute_keep_indices(
         self,
