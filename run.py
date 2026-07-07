@@ -28,15 +28,17 @@ HF_REPO_ID    = "deepseek-ai/DeepSeek-Coder-V2-Lite-Base"  # HuggingFace 仓库 
 USE_HF_MIRROR = True   # 国内设 True 走 hf-mirror.com 镜像加速
 AUTO_DOWNLOAD = True   # 检测到权重缺失时是否自动下载
 
-# 阈值驱逐：信息量低于 threshold 的 latent 才被丢弃，丢弃数量随内容自适应，
-# 不强制固定比例。threshold 越高 → 驱逐越激进（保留越少）。典型范围 0.2 ~ 0.4。
+# 肘部法自适应驱逐：对 importance 分数的归一化累积质量曲线求肘部（knee），
+# 同时用 coverage_floor 作为硬下界，保证保留的 importance mass 不低于该比例。
+# keep_k = max(knee_k, cov_k)，再由 min/max_keep 比例做最终 clamp。
 #
-# 验证阶段策略（重要）：仅在 Prefill 阶段做一次性/分块驱逐；Decode 阶段纯追加，
-# 不做逐 token 的评分/切片，避免显存不连续重排拖垮 tokens/s。先把质量指标测出来，
-# 在线滑窗驱逐留作后续工程加速。该策略由 prefill_only=True 强制保证。
-EVICTION_THRESHOLD = 0.3   # 信息量阈值
-EVICTION_WINDOW    = 4     # 邻居冗余检测窗口半径
-EVICTION_PREFILL_ONLY = True  # 仅 Prefill 驱逐，Decode 纯追加（验证阶段推荐）
+# 验证阶段策略（重要）：仅在 Prefill 阶段做一次性驱逐；Decode 阶段纯追加，
+# 不做逐 token 的评分/切片，避免显存不连续重排拖垮 tokens/s。
+EVICTION_COVERAGE_FLOOR = 0.90  # 保留至少 90% importance mass（肘部法下界）
+EVICTION_MIN_KEEP       = 0.30  # mid token 保留率硬下界
+EVICTION_MAX_KEEP       = 0.98  # mid token 保留率硬上界（至少驱逐 2%）
+EVICTION_WINDOW         = 4     # 邻居冗余检测窗口半径（fallback 路径用）
+EVICTION_PREFILL_ONLY   = True  # 仅 Prefill 驱逐，Decode 纯追加（验证阶段推荐）
 MAX_NEW_TOKENS     = 200   # 生成最多多少个新 token（质量验证时用）
 DTYPE              = torch.bfloat16  # 推理精度，A100/H100 用 bfloat16，其他可改 float16
 
@@ -186,14 +188,19 @@ def _bind_latent_eviction_config(model):
     """
     import types
 
-    def configure_latent_eviction(self, enabled, threshold=None, window=None,
-                                  prefill_only=None):
+    def configure_latent_eviction(self, enabled, coverage_floor=None,
+                                  min_keep=None, max_keep=None,
+                                  window=None, prefill_only=None):
         n = 0
         for module in self.modules():
             if type(module).__name__ == "DeepseekV2Attention":
                 module.latent_eviction = enabled
-                if threshold is not None:
-                    module.latent_eviction_threshold = threshold
+                if coverage_floor is not None:
+                    module.latent_eviction_coverage_floor = coverage_floor
+                if min_keep is not None:
+                    module.latent_eviction_min_keep = min_keep
+                if max_keep is not None:
+                    module.latent_eviction_max_keep = max_keep
                 if window is not None:
                     module.latent_eviction_window = window
                 if prefill_only is not None:
@@ -313,13 +320,13 @@ def compare_compression(model, tokenizer, prompt: str):
     input_len, lens_base = measure_prefill_cache(model, tokenizer, prompt)
     print_cache_stats("无驱逐（基准）", input_len, lens_base, model)
 
-    model.configure_latent_eviction(enabled=True, threshold=0.2, window=EVICTION_WINDOW)
+    model.configure_latent_eviction(enabled=True, coverage_floor=0.80, window=EVICTION_WINDOW)
     _, lens_lo = measure_prefill_cache(model, tokenizer, prompt)
-    print_cache_stats("保守驱逐（threshold=0.2）", input_len, lens_lo, model)
+    print_cache_stats("激进驱逐（coverage_floor=0.80）", input_len, lens_lo, model)
 
-    model.configure_latent_eviction(enabled=True, threshold=0.3, window=EVICTION_WINDOW)
+    model.configure_latent_eviction(enabled=True, coverage_floor=0.90, window=EVICTION_WINDOW)
     _, lens_hi = measure_prefill_cache(model, tokenizer, prompt)
-    print_cache_stats("标准驱逐（threshold=0.3）", input_len, lens_hi, model)
+    print_cache_stats("标准驱逐（coverage_floor=0.90）", input_len, lens_hi, model)
 
     model.configure_latent_eviction(enabled=False)
 
@@ -377,8 +384,9 @@ def quality_check(model, tokenizer):
 
         # 开启驱逐
         model.configure_latent_eviction(
-            enabled=True, threshold=EVICTION_THRESHOLD, window=EVICTION_WINDOW,
-            prefill_only=EVICTION_PREFILL_ONLY,
+            enabled=True, coverage_floor=EVICTION_COVERAGE_FLOOR,
+            min_keep=EVICTION_MIN_KEEP, max_keep=EVICTION_MAX_KEEP,
+            window=EVICTION_WINDOW, prefill_only=EVICTION_PREFILL_ONLY,
         )
         text_evict = generate_text(model, tokenizer, prompt)
 
@@ -386,7 +394,7 @@ def quality_check(model, tokenizer):
         wrap = lambda s: "\n    ".join(textwrap.wrap(s, width=70))
         print(f"\n  ▸ [无驱逐]")
         print(f"    {wrap(text_base)}")
-        print(f"\n  ▸ [驱逐 threshold={EVICTION_THRESHOLD}, window={EVICTION_WINDOW}]")
+        print(f"\n  ▸ [驱逐 coverage={EVICTION_COVERAGE_FLOOR}, window={EVICTION_WINDOW}]")
         print(f"    {wrap(text_evict)}")
 
         # 简单字符串相似度：相同字符比例（粗略指标）

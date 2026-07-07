@@ -150,7 +150,7 @@ def _oracle_scores(q_abs: torch.Tensor, c_kv: torch.Tensor,
     col_sum = probs.sum(dim=2).mean(dim=1)                      # [B, S]
 
     # Value-aware weighting  ‖W_UV @ c_j‖₂ per token, averaged over heads
-    val_proj = torch.einsum("bnr,hdr->bhnd", c_kv.float(), W_UV)
+    val_proj = torch.einsum("bnr,hdr->bhnd", c_kv.float(), W_UV.float())
     val_norm = val_proj.norm(dim=-1).mean(dim=1)                # [B, S]
     v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
     val_norm = val_norm / v_mean
@@ -176,7 +176,8 @@ def _load_corpus(tokenizer, n_tokens: int) -> torch.Tensor:
         snippets = [ex["whole_func_string"] for ex in ds
                     if ex.get("whole_func_string", "").strip()]
         if snippets:
-            text = "\n\n".join(snippets)
+            raw  = "\n\n".join(snippets)
+            text = raw[:n_tokens * 5]   # ~5 chars/token — truncate BEFORE tokenizing
             print(f"  Corpus : code-search-net Python ({len(snippets):,} functions)")
     except Exception as exc:
         print(f"  [WARN] code-search-net unavailable ({exc}); using built-in code")

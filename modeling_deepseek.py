@@ -786,14 +786,18 @@ class DeepseekV2Attention(nn.Module):
         # （实际拆分在 forward 里执行，因为 kv_b_proj 的权重在 __init__ 结束后才确定）
 
         # ----- Latent Eviction Config (MLA KV Cache Compression Research) -----
-        # Enable latent-based token eviction during prefill to compress the KV cache.
-        # Each token's c_t^{KV} latent is scored by compute_latent_info_score (a blend
-        # of L2 norm, negative entropy, per-dim variance, minus neighbour redundancy).
-        # Tokens whose composite info score falls BELOW `threshold` are dropped before
-        # the cache write. The number evicted is content-adaptive, NOT a fixed ratio.
+        # Budget is decided per-sequence via the elbow (knee) of the sorted
+        # importance-score curve, ensuring at least `coverage_floor` of total
+        # importance mass is retained.  Replaces the old fixed threshold.
         self.latent_eviction = True              # Set True to enable eviction during prefill
-        self.latent_eviction_threshold = 0.3     # Drop tokens with info score below this
-        self.latent_eviction_window = 4          # Neighbour radius for redundancy detection
+        self.latent_eviction_window = 4          # Neighbour radius for redundancy (fallback path only)
+        # ---- Adaptive budget: knee detection + coverage floor ----------------
+        # keep_k = max( knee_k, cov_k ) where:
+        #   knee_k = argmax_k[ C(k) - k/n ]  (elbow of cumulative-mass curve)
+        #   cov_k  = min k s.t. C(k) >= coverage_floor
+        self.latent_eviction_coverage_floor = 0.85  # min fraction of importance mass to retain
+        self.latent_eviction_min_keep       = 0.30  # hard lower bound on mid-token keep ratio
+        self.latent_eviction_max_keep       = 0.98  # hard upper bound (always evict >= 2%)
         # Eviction is intentionally restricted to the ONE-SHOT prefill pass. During
         # autoregressive decode the cache is APPEND-ONLY: no scoring, no top-k, no
         # gather/slice. Per-token tensor slicing in decode would force repeated
@@ -879,6 +883,65 @@ class DeepseekV2Attention(nn.Module):
             .contiguous()
         )
 
+    @staticmethod
+    def _adaptive_budget(
+        info_mid: torch.Tensor,
+        coverage_floor: float,
+        min_keep: float,
+        max_keep: float,
+    ) -> int:
+        """
+        Adaptive keep-k via elbow (knee) detection on the cumulative-mass curve.
+
+        Algorithm
+        ---------
+        1. Shift info_mid to >= 0 and normalise to a probability mass distribution.
+        2. Sort descending; form the concave cumulative-mass curve C(k), k = 1..n.
+        3. Knee = argmax_k [ C(k) - k/n ].
+           Geometry: the point on the curve furthest above the diagonal (0,0)->(1,1).
+           · Concentrated distributions -> knee is early   (aggressive eviction)
+           · Flat distributions         -> knee is central (moderate eviction)
+        4. Coverage floor: smallest k_cov s.t. C(k_cov) >= coverage_floor.
+        5. keep_k = max(knee_k, k_cov) -- adapts to content, never below the floor.
+        6. Clamp to [min_keep, max_keep] x n_mid.
+
+        Why max(knee, coverage_floor)?
+          For near-uniform importance, cumsum is almost linear and the knee lands
+          around n/2, which would evict too much.  The coverage floor of 0.90
+          correctly prevents this and keeps enough tokens.
+        """
+        n      = info_mid.shape[1]
+        device = info_mid.device
+
+        # 1. Shift to non-negative, normalise to mass distribution
+        scores = info_mid.float()
+        scores = scores - scores.min(dim=-1, keepdim=True).values   # [B, n] >= 0
+        total  = scores.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        mass   = scores / total                                      # [B, n], row-sums to 1
+
+        # 2. Sort descending, cumulative sum
+        sorted_mass = mass.sort(dim=-1, descending=True).values      # [B, n]
+        cumsum      = sorted_mass.cumsum(dim=-1)                     # [B, n], 0 -> 1
+
+        # 3. Knee: argmax_k( C(k) - k/n ),  k in {1..n}
+        x      = torch.arange(1, n + 1, device=device, dtype=torch.float32) / n  # [n]
+        dist   = cumsum - x.unsqueeze(0)                             # [B, n]
+        knee_k = int(dist.argmax(dim=-1).max().item()) + 1           # 1-indexed, batch-max
+
+        # 4. Coverage floor: min k s.t. C(k) >= coverage_floor
+        cov_k  = int(
+            (cumsum >= coverage_floor).long().argmax(dim=-1).max().item()
+        ) + 1
+
+        # 5. Take the larger (guarantee coverage floor)
+        keep_k = max(knee_k, cov_k)
+
+        # 6. Hard ratio bounds
+        keep_k = max(keep_k, max(1, int(n * min_keep)))
+        keep_k = min(keep_k, max(1, int(n * max_keep)))
+
+        return keep_k
+
 
 def compute_latent_info_score(
     compressed_kv: torch.Tensor,
@@ -958,6 +1021,7 @@ def compute_latent_info_score(
     return info                                               # [B, S]
 
 
+
     def _compute_keep_indices(
         self,
         compressed_kv: torch.Tensor,
@@ -971,16 +1035,15 @@ def compute_latent_info_score(
         评分公式（q_abs 和 W_UV 均可用时）：
           Importance[j] = mean_H( Σ_i prob_{i,j} × ‖W_UV @ c_j‖₂ )
 
-          · Σ_i prob_{i,j}  ：因果 attention 列求和，衡量「被注意了多少次」
-          · ‖W_UV @ c_j‖₂  ：Value 投影 L2 范数，衡量「影响输出空间的幅度」
-
-          两者相乘的意义：
-            - 虚词（"的"/"了"）注意力列和高但 Value 范数低 → 综合得分中等，可驱逐
-            - 罕见专名注意力中等但 Value 范数高 → 综合得分高，被保留
+        Budget 决策：肘部法（Knee Detection）+ 覆盖率下界
+          · 对 info_mid 归一化累积质量曲线 C(k)，求肘部：
+              knee_k = argmax_k[ C(k) − k/n ]   （曲线距对角线最远点）
+          · cov_k  = min k s.t. C(k) >= latent_eviction_coverage_floor
+          · keep_k = max(knee_k, cov_k)  —— 自适应，不低于覆盖率下界
 
         退化策略（按可用性自动选择）：
           · 仅 q_abs          → 纯列求和（无 Value 权重）
-          · 仅 W_UV / 均无    → 统计评分（L2 范数 + 负熵 + 方差 - 冗余），可乘 Value 范数
+          · 仅 W_UV / 均无    → 统计评分（compute_latent_info_score），可乘 Value 范数
 
         无条件保护：
           · 前 latent_eviction_sink_tokens   个 token（attention sink）
@@ -1002,16 +1065,7 @@ def compute_latent_info_score(
         n_recent = min(self.latent_eviction_recent_tokens, max(0, seq_len - n_sink))
         n_mid    = seq_len - n_sink - n_recent
 
-        # ── 用统计阈值估算总 keep_k（自适应驱逐量，与主评分无关）────────────
-        info_all    = compute_latent_info_score(compressed_kv, window=self.latent_eviction_window)
-        keep_mask   = info_all >= self.latent_eviction_threshold
-        keep_counts = keep_mask.sum(dim=-1).clamp(min=1)
-        keep_k      = int(keep_counts.max().item())
-        keep_k      = max(keep_k, n_sink + n_recent + 1)  # sink + recent 必须全留
-        keep_k      = min(keep_k, seq_len)
-        n_mid_keep  = max(0, keep_k - n_sink - n_recent)
-
-        if n_mid <= 0 or n_mid_keep >= n_mid:
+        if n_mid <= 0:
             keep_idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1).clone()
             logger.debug(
                 f"Latent eviction [layer {self.layer_idx}]: "
@@ -1022,59 +1076,67 @@ def compute_latent_info_score(
         mid_latent = compressed_kv[:, n_sink : seq_len - n_recent, :]  # [B, n_mid, R]
 
         # ── Value 范数（预先计算，与评分方法正交）────────────────────────────
-        # val_norm[j] = mean_H( ‖W_UV @ c_j‖₂ )，归一化到均值≈1 防量纲溢出。
         val_norm = None
         if W_UV is not None:
-            # W_UV: [H, v_head_dim, R]; mid_latent: [B, n_mid, R]
-            # val_proj: [B, H, n_mid, v_head_dim]
             val_proj = torch.einsum("bnr,hdr->bhnd", mid_latent, W_UV).float()
             val_norm = val_proj.norm(dim=-1).mean(dim=1)              # [B, n_mid]
             v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
-            val_norm = val_norm / v_mean                              # 均值归一化到 1
+            val_norm = val_norm / v_mean
 
-        # ── 主评分 ────────────────────────────────────────────────────────
+        # ── 主评分（先算分再决定 budget，顺序与旧版相反）──────────────────
         if q_abs is not None:
             # ── Query-Aware：因果 attention 列求和 × Value 范数（可选）───────
-            # 长序列保护：n_mid=32k 时全量矩阵 [B,H,32k,32k] fp32 ≈ 68 GB → OOM。
-            # 改为随机子采样 K 个 query 行，列求和是无偏估计，仅增加排序噪声。
-            # 内存：O(K×n) vs O(n²)；32k@K=512 ≈ 1 GB，128k@K=512 ≈ 4 GB。
             q_mid = q_abs[:, :, n_sink : seq_len - n_recent, :]       # [B, H, n_mid, R]
             K = min(self.latent_eviction_score_queries, n_mid)
 
             if K < n_mid:
-                # 随机均匀采样 K 个 query 位置，sort 保持时序（因果掩码需要）
-                sample_pos = torch.randperm(n_mid, device=device)[:K].sort().values  # [K]
+                sample_pos = torch.randperm(n_mid, device=device)[:K].sort().values
                 q_scored   = q_mid[:, :, sample_pos, :]                # [B, H, K, R]
-                # causal_mask[k, j] = True ↔ key j 在采样 query k 之后（应屏蔽）
                 causal_mask = (
-                    torch.arange(n_mid, device=device).unsqueeze(0)   # [1, n_mid]
-                    > sample_pos.unsqueeze(1)                           # [K, 1]
+                    torch.arange(n_mid, device=device).unsqueeze(0)
+                    > sample_pos.unsqueeze(1)
                 )  # [K, n_mid] bool
             else:
-                q_scored    = q_mid                                    # 序列短，用全量
+                q_scored    = q_mid
                 causal_mask = ~torch.tril(
                     torch.ones(n_mid, n_mid, device=device, dtype=torch.bool)
-                )  # [n_mid, n_mid]: True = 上三角（key > query，屏蔽）
+                )
 
             attn_logits = torch.matmul(
                 q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
-            ) * self.softmax_scale                                     # [B, H, K, n_mid]
-            attn_logits = attn_logits.masked_fill(
-                causal_mask[None, None], float("-inf")
-            )
+            ) * self.softmax_scale
+            attn_logits = attn_logits.masked_fill(causal_mask[None, None], float("-inf"))
             attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
             col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
 
             if val_norm is not None:
-                # Value-Aware: 列和 × ‖W_UV @ c_j‖，再对 head 取均值
                 info_mid = (col_sum * val_norm.unsqueeze(1)).mean(dim=1)  # [B, n_mid]
             else:
-                info_mid = col_sum.mean(dim=1)                         # [B, n_mid]
+                info_mid = col_sum.mean(dim=1)
         else:
-            # ── 统计 Fallback ──────────────────────────────────────────────
-            info_mid = info_all[:, n_sink : seq_len - n_recent].float()
+            # ── 统计 Fallback（q_abs 不可用时，仅此路径才调用统计评分）──────
+            info_stat = compute_latent_info_score(
+                compressed_kv, window=self.latent_eviction_window)
+            info_mid = info_stat[:, n_sink : seq_len - n_recent].float()
             if val_norm is not None:
                 info_mid = info_mid * val_norm
+
+        # ── 自适应 Budget：肘部法 + 覆盖率下界 ────────────────────────────
+        n_mid_keep = self._adaptive_budget(
+            info_mid,
+            coverage_floor = self.latent_eviction_coverage_floor,
+            min_keep       = self.latent_eviction_min_keep,
+            max_keep       = self.latent_eviction_max_keep,
+        )
+
+        if n_mid_keep >= n_mid:
+            keep_idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1).clone()
+            logger.debug(
+                f"Latent eviction [layer {self.layer_idx}]: "
+                f"chunk={seq_len}, no eviction needed "
+                f"(n_mid_keep={n_mid_keep} >= n_mid={n_mid})"
+            )
+            return keep_idx
 
         # ── Top-K 选中间段，拼合 Sink + 中间 + Recent ─────────────────────
         mid_order    = info_mid.argsort(dim=-1, descending=True)[:, :n_mid_keep]
@@ -1328,6 +1390,7 @@ def compute_latent_info_score(
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
 
 
 
