@@ -795,24 +795,9 @@ class DeepseekV2Attention(nn.Module):
         # keep_k = max( knee_k, cov_k ) where:
         #   knee_k = argmax_k[ C(k) - k/n ]  (elbow of cumulative-mass curve)
         #   cov_k  = min k s.t. C(k) >= coverage_floor
-        self.latent_eviction_coverage_floor  = 0.85  # min fraction of importance mass to retain
-        self.latent_eviction_min_keep        = 0.30  # hard lower bound on mid-token keep ratio
-        self.latent_eviction_max_keep        = 0.98  # hard upper bound (always evict >= 2%)
-        # ---- Multi-layer committee scoring ----------------------------------
-        # Layers in score_layers each compute importance scores independently.
-        # decision_layer averages all committee scores before the final decision.
-        # Averaging over 5 layers reduces per-layer noise (early layers are less
-        # stable; late layers over-smooth).
-        self.latent_eviction_score_layers    = [4, 6, 8, 12, 16]
-        self.latent_eviction_decision_layer  = 16   # final aggregation layer (was 6)
-        # ---- Soft eviction: Super Tokens ------------------------------------
-        # Evicted tokens are NOT discarded; every pool_ratio consecutive evicted
-        # tokens are merged into one super token and appended to the cache.
-        #   content (latent c): importance-score weighted softmax average
-        #   position (k_pe):    uniform average (RoPE phases must stay coherent)
-        # cache layout after eviction: [sink | kept_mid | recent] + [super ...]
-        self.latent_eviction_pool_ratio       = 4    # n_evicted // pool_ratio = n_super
-        self.latent_eviction_pool_temperature = 0.1  # softmax temperature for content pooling
+        self.latent_eviction_coverage_floor = 0.85  # min fraction of importance mass to retain
+        self.latent_eviction_min_keep       = 0.30  # hard lower bound on mid-token keep ratio
+        self.latent_eviction_max_keep       = 0.98  # hard upper bound (always evict >= 2%)
         # Eviction is intentionally restricted to the ONE-SHOT prefill pass. During
         # autoregressive decode the cache is APPEND-ONLY: no scoring, no top-k, no
         # gather/slice. Per-token tensor slicing in decode would force repeated
@@ -829,6 +814,11 @@ class DeepseekV2Attention(nn.Module):
         # under-values them. Protect them unconditionally as well.
         self.latent_eviction_sink_tokens     = 4    # Always keep first N tokens
         self.latent_eviction_recent_tokens   = 16   # Always keep last N tokens
+        # Decision layer: eviction indices are computed at this layer and broadcast
+        # to all layers. Layers 0..D-1 are retroactively trimmed on the spot.
+        # Empirically Config-B (layer-0 shared) degrades heavily; features stabilise
+        # around layer 6 in DeepSeek-V2-Lite (oracle gap ≤ 0.5 PPL from L6 onward).
+        self.latent_eviction_decision_layer  = 6    # Layer that computes the decision
         # Long-sequence guard: full [n_mid, n_mid] scoring matrix is infeasible at
         # 32k+ prefill (32k × 16 heads × fp32 ≈ 68 GB → OOM).
         # Subsample K query rows instead; column-sum becomes an unbiased estimator.
@@ -952,162 +942,117 @@ class DeepseekV2Attention(nn.Module):
 
         return keep_k
 
-    def _compute_importance_scores(
-        self,
-        compressed_kv: torch.Tensor,
-        q_abs: Optional[torch.Tensor] = None,
-        W_UV: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        """
-        Compute query-aware × value-aware importance scores for mid tokens.
 
-        Called once per committee layer.  Results are accumulated and averaged
-        by the decision layer before _compute_keep_indices is invoked.
+def compute_latent_info_score(
+    compressed_kv: torch.Tensor,
+    window: int = 4,
+    w_norm: float = 0.4,
+    w_entropy: float = 0.3,
+    w_variance: float = 0.3,
+    w_redundancy: float = 0.5,
+) -> torch.Tensor:
+    """
+    Compute a composite *information score* for each latent KV vector (c_t^{KV}).
 
-        Returns info_mid [B, n_mid], or None if there are no mid tokens.
-        """
-        bsz, seq_len, R = compressed_kv.shape
-        device = compressed_kv.device
+    Instead of a single metric, this blends several complementary signals so that
+    a token is considered low-information if it is weak across the board OR is
+    largely a duplicate of its neighbours. Tokens whose score falls below a
+    threshold can then be evicted before the cache write ("read, forget the
+    filler, remember the key parts").
 
-        n_sink   = min(self.latent_eviction_sink_tokens,   seq_len)
-        n_recent = min(self.latent_eviction_recent_tokens, max(0, seq_len - n_sink))
-        n_mid    = seq_len - n_sink - n_recent
+    Signals (each min-max normalized to [0, 1] across the sequence):
+        - L2 norm            : magnitude of the latent  (larger = richer)
+        - negative entropy   : peakedness of softmax(c) (sharper = more specific)
+        - per-dim variance   : spread across dimensions  (flatter = more redundant)
+    Penalty:
+        - neighbour redundancy: max cosine similarity to tokens within `window`
+                                (high similarity = duplicate = less worth keeping)
 
-        if n_mid <= 0:
-            return None
+    Composite:
+        info = w_norm*norm + w_entropy*neg_entropy + w_variance*variance
+               - w_redundancy*redundancy
+    The positive weights are intended to sum to 1.0, so the informative part lies
+    in [0, 1] and the redundancy penalty pulls duplicates down toward (and below) 0.
 
-        mid_latent = compressed_kv[:, n_sink : seq_len - n_recent, :]  # [B, n_mid, R]
+    Args:
+        compressed_kv: [B, S, kv_lora_rank]  latent vectors after kv_a_proj_with_mqa
+        window:        neighbour radius for redundancy detection
+        w_norm/w_entropy/w_variance: weights of the informativeness signals
+        w_redundancy:  weight of the neighbour-redundancy penalty
 
-        val_norm = None
-        if W_UV is not None:
-            val_proj = torch.einsum("bnr,hdr->bhnd", mid_latent, W_UV).float()
-            val_norm = val_proj.norm(dim=-1).mean(dim=1)              # [B, n_mid]
-            v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
-            val_norm = val_norm / v_mean
+    Returns:
+        info: [B, S]  composite information score, higher = more worth keeping
+    """
+    x = compressed_kv.float()
+    bsz, seq_len, _ = x.shape
 
-        if q_abs is not None:
-            q_mid = q_abs[:, :, n_sink : seq_len - n_recent, :]
-            K = min(self.latent_eviction_score_queries, n_mid)
+    # --- Signal 1: L2 norm (magnitude / richness) ---
+    norm = x.norm(dim=-1)                                      # [B, S]
 
-            if K < n_mid:
-                sample_pos  = torch.randperm(n_mid, device=device)[:K].sort().values
-                q_scored    = q_mid[:, :, sample_pos, :]
-                causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
-                               > sample_pos.unsqueeze(1))
-            else:
-                q_scored    = q_mid
-                causal_mask = ~torch.tril(
-                    torch.ones(n_mid, n_mid, device=device, dtype=torch.bool))
+    # --- Signal 2: negative normalized entropy (distribution peakedness) ---
+    prob = F.softmax(x, dim=-1)
+    entropy = -(prob * (prob + 1e-10).log()).sum(dim=-1)      # [B, S]
+    neg_entropy = -entropy                                     # peaked = more info
 
-            attn_logits = torch.matmul(
-                q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
-            ) * self.softmax_scale
-            attn_logits = attn_logits.masked_fill(causal_mask[None, None], float("-inf"))
-            attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
-            col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
+    # --- Signal 3: per-dimension variance (spread / non-flatness) ---
+    variance = x.var(dim=-1)                                   # [B, S]
 
-            if val_norm is not None:
-                info_mid = (col_sum * val_norm.unsqueeze(1)).mean(dim=1)
-            else:
-                info_mid = col_sum.mean(dim=1)
-        else:
-            info_stat = compute_latent_info_score(compressed_kv, window=self.latent_eviction_window)
-            info_mid  = info_stat[:, n_sink : seq_len - n_recent].float()
-            if val_norm is not None:
-                info_mid = info_mid * val_norm
+    # --- Penalty: neighbour redundancy via local cosine similarity ---
+    # Compare each token only with up to `window` neighbours on each side using
+    # cheap shifted dot-products (O(S * window * D)), avoiding a full S x S matrix.
+    x_unit = F.normalize(x, dim=-1)                            # [B, S, D]
+    redundancy = torch.zeros(bsz, seq_len, device=x.device, dtype=x.dtype)
+    for offset in range(1, max(1, window) + 1):
+        if offset >= seq_len:
+            break
+        # cosine similarity between token t and token (t - offset)
+        sim = (x_unit[:, offset:, :] * x_unit[:, :-offset, :]).sum(dim=-1)  # [B, S-offset]
+        # redundancy is symmetric: both tokens in the pair are "duplicates"
+        redundancy[:, offset:] = torch.maximum(redundancy[:, offset:], sim)
+        redundancy[:, :-offset] = torch.maximum(redundancy[:, :-offset], sim)
 
-        return info_mid                                                # [B, n_mid]
-
-    @staticmethod
-    def _make_super_tokens(
-        cached_latent:    torch.Tensor,   # [B, 1, seq_len, R]
-        cached_kpe:       torch.Tensor,   # [B, 1, seq_len, kpe_dim]
-        keep_indices:     torch.Tensor,   # [B, keep_k]  absolute positions
-        info_mid:         torch.Tensor,   # [B, n_mid]
-        n_sink:           int,
-        n_recent:         int,
-        pool_ratio:       int,
-        pool_temperature: float,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Soft eviction: merge evicted mid tokens into super tokens via pooling.
-
-        Content (latent c): importance-score weighted softmax average per chunk.
-        Position (k_pe):    uniform average (RoPE phases cannot be importance-
-                            weighted without distorting position encoding).
-
-        Returns (super_c, super_kpe) each [B, 1, n_super, dim], or (None, None).
-        """
-        B, _, seq_len, R  = cached_latent.shape
-        kpe_dim            = cached_kpe.shape[-1]
-        n_mid              = seq_len - n_sink - n_recent
-
-        if n_mid <= 0 or pool_ratio <= 0:
-            return None, None
-
-        dev       = cached_latent.device
-        mid_range = torch.arange(n_sink, seq_len - n_recent, device=dev)  # [n_mid]
-
-        is_kept = torch.zeros(seq_len, dtype=torch.bool, device=dev)
-        is_kept[keep_indices[0]] = True                                # batch-1 inference
-
-        evicted_mask = ~is_kept[mid_range]                             # [n_mid] bool
-        evicted_abs  = mid_range[evicted_mask]                         # [n_evicted]
-        n_evicted    = evicted_abs.shape[0]
-
-        n_super = n_evicted // pool_ratio
-        if n_super == 0:
-            return None, None
-
-        n_use           = n_super * pool_ratio
-        evicted_abs_use = evicted_abs[:n_use]                          # [n_use]
-
-        ev_c   = cached_latent[:, :, evicted_abs_use, :]               # [B, 1, n_use, R]
-        ev_kpe = cached_kpe[:, :, evicted_abs_use, :]                  # [B, 1, n_use, kpe_dim]
-
-        ev_mid_rel = evicted_abs_use - n_sink                          # [n_use] → mid-relative
-        ev_scores  = info_mid[:, ev_mid_rel]                           # [B, n_use]
-
-        c_chunks     = ev_c.squeeze(1).view(B, n_super, pool_ratio, R)
-        kpe_chunks   = ev_kpe.squeeze(1).view(B, n_super, pool_ratio, kpe_dim)
-        score_chunks = ev_scores.view(B, n_super, pool_ratio)
-
-        # Importance-weighted content pooling
-        weights  = torch.softmax(score_chunks / max(pool_temperature, 1e-4), dim=-1)
-        super_c  = (c_chunks * weights.unsqueeze(-1)).sum(dim=2).unsqueeze(1)
-
-        # Uniform position pooling (preserve spatial locality)
-        super_kpe = kpe_chunks.mean(dim=2).unsqueeze(1)
-
-        return super_c.to(cached_latent.dtype), super_kpe.to(cached_kpe.dtype)
-
-
-                                               # [B, S]
+    # --- Composite information score ---
+    info = (
+        w_norm * _robust_normalize(norm)
+        + w_entropy * _robust_normalize(neg_entropy)
+        + w_variance * _robust_normalize(variance)
+        - w_redundancy * _robust_normalize(redundancy)
+    )
+    return info                                               # [B, S]
 
 
 
     def _compute_keep_indices(
         self,
         compressed_kv: torch.Tensor,
-        aggregated_info_mid: torch.Tensor,   # [B, n_mid] — averaged over committee layers
+        q_abs: Optional[torch.Tensor] = None,
+        W_UV: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """[核心优化点 1：Adaptive Budget from Multi-Layer Committee Scores]
+        """[核心优化点 1：Value-Aware Query-Aware 评分 + Sink/Recency 保护]
 
-        Receives pre-computed importance scores (averaged over all committee layers)
-        and returns the token indices to keep.
+        在 latent_eviction_decision_layer 调用一次，供所有层共享驱逐决策。
+
+        评分公式（q_abs 和 W_UV 均可用时）：
+          Importance[j] = mean_H( Σ_i prob_{i,j} × ‖W_UV @ c_j‖₂ )
 
         Budget 决策：肘部法（Knee Detection）+ 覆盖率下界
-          · knee_k = argmax_k[ C(k) − k/n ]   （曲线距对角线最远点）
+          · 对 info_mid 归一化累积质量曲线 C(k)，求肘部：
+              knee_k = argmax_k[ C(k) − k/n ]   （曲线距对角线最远点）
           · cov_k  = min k s.t. C(k) >= latent_eviction_coverage_floor
-          · keep_k = max(knee_k, cov_k)
+          · keep_k = max(knee_k, cov_k)  —— 自适应，不低于覆盖率下界
+
+        退化策略（按可用性自动选择）：
+          · 仅 q_abs          → 纯列求和（无 Value 权重）
+          · 仅 W_UV / 均无    → 统计评分（compute_latent_info_score），可乘 Value 范数
 
         无条件保护：
           · 前 latent_eviction_sink_tokens   个 token（attention sink）
           · 后 latent_eviction_recent_tokens 个 token（recency 偏差）
 
         Args:
-            compressed_kv       : [B, S, kv_lora_rank]  归一化 latent
-            aggregated_info_mid : [B, n_mid]  multi-layer averaged importance scores
+            compressed_kv : [B, S, kv_lora_rank]          归一化 latent
+            q_abs         : [B, H, S, kv_lora_rank] | None  absorbed query
+            W_UV          : [H, v_head_dim, kv_lora_rank] | None  Value 投影矩阵
 
         Returns:
             keep_indices  : [B, keep_k]  按时序升序
@@ -1128,9 +1073,57 @@ class DeepseekV2Attention(nn.Module):
             )
             return keep_idx
 
-        # ── 自适应 Budget（使用多层委员会聚合的 importance scores）──────────
+        mid_latent = compressed_kv[:, n_sink : seq_len - n_recent, :]  # [B, n_mid, R]
+
+        # ── Value 范数（预先计算，与评分方法正交）────────────────────────────
+        val_norm = None
+        if W_UV is not None:
+            val_proj = torch.einsum("bnr,hdr->bhnd", mid_latent, W_UV).float()
+            val_norm = val_proj.norm(dim=-1).mean(dim=1)              # [B, n_mid]
+            v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+            val_norm = val_norm / v_mean
+
+        # ── 主评分（先算分再决定 budget，顺序与旧版相反）──────────────────
+        if q_abs is not None:
+            # ── Query-Aware：因果 attention 列求和 × Value 范数（可选）───────
+            q_mid = q_abs[:, :, n_sink : seq_len - n_recent, :]       # [B, H, n_mid, R]
+            K = min(self.latent_eviction_score_queries, n_mid)
+
+            if K < n_mid:
+                sample_pos = torch.randperm(n_mid, device=device)[:K].sort().values
+                q_scored   = q_mid[:, :, sample_pos, :]                # [B, H, K, R]
+                causal_mask = (
+                    torch.arange(n_mid, device=device).unsqueeze(0)
+                    > sample_pos.unsqueeze(1)
+                )  # [K, n_mid] bool
+            else:
+                q_scored    = q_mid
+                causal_mask = ~torch.tril(
+                    torch.ones(n_mid, n_mid, device=device, dtype=torch.bool)
+                )
+
+            attn_logits = torch.matmul(
+                q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
+            ) * self.softmax_scale
+            attn_logits = attn_logits.masked_fill(causal_mask[None, None], float("-inf"))
+            attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
+            col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
+
+            if val_norm is not None:
+                info_mid = (col_sum * val_norm.unsqueeze(1)).mean(dim=1)  # [B, n_mid]
+            else:
+                info_mid = col_sum.mean(dim=1)
+        else:
+            # ── 统计 Fallback（q_abs 不可用时，仅此路径才调用统计评分）──────
+            info_stat = compute_latent_info_score(
+                compressed_kv, window=self.latent_eviction_window)
+            info_mid = info_stat[:, n_sink : seq_len - n_recent].float()
+            if val_norm is not None:
+                info_mid = info_mid * val_norm
+
+        # ── 自适应 Budget：肘部法 + 覆盖率下界 ────────────────────────────
         n_mid_keep = self._adaptive_budget(
-            aggregated_info_mid,
+            info_mid,
             coverage_floor = self.latent_eviction_coverage_floor,
             min_keep       = self.latent_eviction_min_keep,
             max_keep       = self.latent_eviction_max_keep,
@@ -1140,12 +1133,13 @@ class DeepseekV2Attention(nn.Module):
             keep_idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1).clone()
             logger.debug(
                 f"Latent eviction [layer {self.layer_idx}]: "
-                f"chunk={seq_len}, no eviction (n_mid_keep={n_mid_keep} >= n_mid={n_mid})"
+                f"chunk={seq_len}, no eviction needed "
+                f"(n_mid_keep={n_mid_keep} >= n_mid={n_mid})"
             )
             return keep_idx
 
         # ── Top-K 选中间段，拼合 Sink + 中间 + Recent ─────────────────────
-        mid_order    = aggregated_info_mid.argsort(dim=-1, descending=True)[:, :n_mid_keep]
+        mid_order    = info_mid.argsort(dim=-1, descending=True)[:, :n_mid_keep]
         mid_keep_idx = (mid_order + n_sink).sort(dim=-1).values
 
         sink_idx   = torch.arange(n_sink,              device=device).unsqueeze(0).expand(bsz, -1)
@@ -1153,8 +1147,12 @@ class DeepseekV2Attention(nn.Module):
         keep_idx   = torch.cat([sink_idx, mid_keep_idx, recent_idx], dim=1).sort(dim=-1).values
 
         evicted = seq_len - keep_idx.shape[1]
+        mode = ("value+query-aware" if (q_abs is not None and W_UV is not None) else
+                "query-aware"       if q_abs is not None else
+                "value+statistical" if W_UV  is not None else
+                "statistical")
         logger.debug(
-            f"Latent eviction [layer {self.layer_idx}] (multi-layer committee): "
+            f"Latent eviction [layer {self.layer_idx}] ({mode}): "
             f"chunk={seq_len}, sink={n_sink}, recent={n_recent}, "
             f"mid_kept={n_mid_keep}/{n_mid}, evicted={evicted} ({evicted/seq_len*100:.1f}%)"
         )
@@ -1273,104 +1271,58 @@ class DeepseekV2Attention(nn.Module):
             )
 
             if _is_first_prefill:
-                # [核心优化点 3：多层委员会决策 + 软驱逐 Super Tokens]
-                #
-                # 多层评分委员会:
-                #   score_layers 中每一层独立计算 importance scores 并累积；
-                #   decision_layer（最后一层）对所有层的分数取均值，得到更稳定的
-                #   综合重要度，再调用 _compute_keep_indices 做最终驱逐决策。
-                #
-                # 软驱逐 Super Tokens:
-                #   被驱逐的 mid tokens 按 pool_ratio 组做加权池化，生成 super tokens
-                #   追加到 cache 末尾，供后续 decode 的 attention 使用。
-                D            = self.latent_eviction_decision_layer
-                score_layers = set(getattr(self, 'latent_eviction_score_layers', [D]))
+                # [核心优化点 3：决策层（Layer D）驱逐 + 溯源修剪]
+                # · Layer < D  → 稠密写入，等待决策层
+                # · Layer == D → 计算 keep_indices（Value-Aware Query-Aware），
+                #                同时回头修剪已写入的 Layer 0..D-1
+                # · Layer > D  → 复用 shared_keep_indices
+                # 改用 Layer 6 而非 Layer 0：实验表明 Layer 0 特征未稳定，
+                # Config-B PPL 退化严重；Layer 6 起与 Oracle 差距 ≤ 0.5 PPL。
+                D = self.latent_eviction_decision_layer
 
-                # ── 委员会层：计算本层 importance scores 并累积 ────────────────
-                if self.layer_idx in score_layers:
-                    _info_this = self._compute_importance_scores(
-                        c_kv_normed, q_abs=q_abs, W_UV=W_UV)
-                    if _info_this is not None:
-                        if not hasattr(past_key_value, '_evict_scores_list'):
-                            past_key_value._evict_scores_list = []
-                        past_key_value._evict_scores_list.append(_info_this.detach())
-
-                keep_indices = None
-
-                # ── 决策层：聚合委员会分数 → 驱逐 + super tokens ─────────────
                 if self.layer_idx == D:
-                    _scores_list = getattr(past_key_value, '_evict_scores_list', None)
-                    if _scores_list:
-                        _agg_info = torch.stack(_scores_list, dim=0).mean(dim=0)  # [B, n_mid]
-                    else:
-                        _agg_info = self._compute_importance_scores(
-                            c_kv_normed, q_abs=q_abs, W_UV=W_UV)
+                    # 传入 q_abs 和 W_UV 启用 Value-Aware Query-Aware 评分
+                    keep_indices = self._compute_keep_indices(
+                        c_kv_normed, q_abs=q_abs, W_UV=W_UV
+                    )
+                    past_key_value.shared_keep_indices = keep_indices
 
-                    if _agg_info is not None:
-                        _n_sink_d   = min(self.latent_eviction_sink_tokens,   q_len)
-                        _n_recent_d = min(self.latent_eviction_recent_tokens,
-                                          max(0, q_len - _n_sink_d))
-
-                        keep_indices = self._compute_keep_indices(c_kv_normed, _agg_info)
-                        past_key_value.shared_keep_indices = keep_indices
-                        past_key_value._shared_agg_info    = (_agg_info, _n_sink_d, _n_recent_d)
-
-                        # ── 溯源修剪 Layer 0..D-1 + 追加 super tokens ──────────
-                        _ret_idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B,1,keep_k,1]
-                        _pool_r  = getattr(self, 'latent_eviction_pool_ratio', 0)
-                        _pool_t  = getattr(self, 'latent_eviction_pool_temperature', 0.1)
-
-                        for _prev in range(D):
-                            if len(past_key_value.key_cache) > _prev:
-                                _pl = past_key_value.key_cache[_prev]
-                                _pk = past_key_value.value_cache[_prev]
-                                _tl = _pl.gather(2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1]))
-                                _tk = _pk.gather(2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1]))
-                                if _pool_r > 0:
-                                    _sc, _sk = self._make_super_tokens(
-                                        _pl, _pk, keep_indices, _agg_info,
-                                        _n_sink_d, _n_recent_d, _pool_r, _pool_t)
-                                    if _sc is not None:
-                                        _tl = torch.cat([_tl, _sc],  dim=2)
-                                        _tk = torch.cat([_tk, _sk],  dim=2)
-                                past_key_value.key_cache[_prev]   = _tl
-                                past_key_value.value_cache[_prev] = _tk
-
-                        # 清理临时累积分数
-                        if hasattr(past_key_value, '_evict_scores_list'):
-                            del past_key_value._evict_scores_list
+                    # [核心优化点 3b：溯源修剪 Layer 0..D-1]
+                    # Layer D 算出索引后立即回头裁剪前面已写入的 cache。
+                    # 各层 key_cache / value_cache 此时存的是完整 prefill 长度，
+                    # 用同一份 keep_indices gather 即可对齐到相同物理长度。
+                    _ret_idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B,1,keep_k,1]
+                    for _prev in range(D):
+                        if len(past_key_value.key_cache) > _prev:
+                            _pl = past_key_value.key_cache[_prev]
+                            _pk = past_key_value.value_cache[_prev]
+                            past_key_value.key_cache[_prev]   = _pl.gather(
+                                2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1])
+                            )
+                            past_key_value.value_cache[_prev] = _pk.gather(
+                                2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1])
+                            )
 
                 elif self.layer_idx > D:
                     keep_indices = getattr(past_key_value, "shared_keep_indices", None)
-                # else: layer_idx < D 且非委员会层 → 稠密写入，keep_indices = None
+                else:
+                    # layer_idx < D：稠密，不驱逐
+                    keep_indices = None
 
                 if keep_indices is not None:
-                    # [核心优化点 4：双轨同步切片（latent + k_pe）+ super tokens]
+                    # [核心优化点 4：双轨同步切片（latent + k_pe 两条轨道）]
                     idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B, 1, keep_k, 1]
                     trimmed_latent = cached_latent.gather(
                         2, idx.expand(-1, 1, -1, cached_latent.shape[-1])
-                    )
+                    )  # [B, 1, keep_k, kv_lora_rank]
                     trimmed_kpe = cached_kpe.gather(
                         2, idx.expand(-1, 1, -1, cached_kpe.shape[-1])
-                    )
+                    )  # [B, 1, keep_k, qk_rope_head_dim]
 
-                    # 软驱逐：追加 super tokens 到当前层 cache
-                    _pool_r = getattr(self, 'latent_eviction_pool_ratio', 0)
-                    if _pool_r > 0:
-                        _agg_t, _ns, _nr = getattr(
-                            past_key_value, '_shared_agg_info',
-                            (None, self.latent_eviction_sink_tokens,
-                             self.latent_eviction_recent_tokens))
-                        if _agg_t is not None:
-                            _pool_t = getattr(self, 'latent_eviction_pool_temperature', 0.1)
-                            _sc, _sk = self._make_super_tokens(
-                                cached_latent, cached_kpe, keep_indices, _agg_t,
-                                _ns, _nr, _pool_r, _pool_t)
-                            if _sc is not None:
-                                trimmed_latent = torch.cat([trimmed_latent, _sc],  dim=2)
-                                trimmed_kpe    = torch.cat([trimmed_kpe,    _sk],  dim=2)
-
-                    # 强制覆写当前层 cache
+                    # 强制覆写当前层 cache（驱逐在此发生）
+                    # 局部变量 cached_latent / cached_kpe 仍指向覆写前的完整张量，
+                    # 当前 forward 的 attention 依然对全量 q_len token 计算；
+                    # 裁剪后的 cache 仅供后续 decode 步骤使用。
                     past_key_value.key_cache[self.layer_idx]   = trimmed_latent
                     past_key_value.value_cache[self.layer_idx] = trimmed_kpe
 
@@ -1442,83 +1394,6 @@ class DeepseekV2Attention(nn.Module):
 
 
 
-
-def compute_latent_info_score(
-    compressed_kv: torch.Tensor,
-    window: int = 4,
-    w_norm: float = 0.4,
-    w_entropy: float = 0.3,
-    w_variance: float = 0.3,
-    w_redundancy: float = 0.5,
-) -> torch.Tensor:
-    """
-    Compute a composite *information score* for each latent KV vector (c_t^{KV}).
-
-    Instead of a single metric, this blends several complementary signals so that
-    a token is considered low-information if it is weak across the board OR is
-    largely a duplicate of its neighbours. Tokens whose score falls below a
-    threshold can then be evicted before the cache write ("read, forget the
-    filler, remember the key parts").
-
-    Signals (each min-max normalized to [0, 1] across the sequence):
-        - L2 norm            : magnitude of the latent  (larger = richer)
-        - negative entropy   : peakedness of softmax(c) (sharper = more specific)
-        - per-dim variance   : spread across dimensions  (flatter = more redundant)
-    Penalty:
-        - neighbour redundancy: max cosine similarity to tokens within `window`
-                                (high similarity = duplicate = less worth keeping)
-
-    Composite:
-        info = w_norm*norm + w_entropy*neg_entropy + w_variance*variance
-               - w_redundancy*redundancy
-    The positive weights are intended to sum to 1.0, so the informative part lies
-    in [0, 1] and the redundancy penalty pulls duplicates down toward (and below) 0.
-
-    Args:
-        compressed_kv: [B, S, kv_lora_rank]  latent vectors after kv_a_proj_with_mqa
-        window:        neighbour radius for redundancy detection
-        w_norm/w_entropy/w_variance: weights of the informativeness signals
-        w_redundancy:  weight of the neighbour-redundancy penalty
-
-    Returns:
-        info: [B, S]  composite information score, higher = more worth keeping
-    """
-    x = compressed_kv.float()
-    bsz, seq_len, _ = x.shape
-
-    # --- Signal 1: L2 norm (magnitude / richness) ---
-    norm = x.norm(dim=-1)                                      # [B, S]
-
-    # --- Signal 2: negative normalized entropy (distribution peakedness) ---
-    prob = F.softmax(x, dim=-1)
-    entropy = -(prob * (prob + 1e-10).log()).sum(dim=-1)      # [B, S]
-    neg_entropy = -entropy                                     # peaked = more info
-
-    # --- Signal 3: per-dimension variance (spread / non-flatness) ---
-    variance = x.var(dim=-1)                                   # [B, S]
-
-    # --- Penalty: neighbour redundancy via local cosine similarity ---
-    # Compare each token only with up to `window` neighbours on each side using
-    # cheap shifted dot-products (O(S * window * D)), avoiding a full S x S matrix.
-    x_unit = F.normalize(x, dim=-1)                            # [B, S, D]
-    redundancy = torch.zeros(bsz, seq_len, device=x.device, dtype=x.dtype)
-    for offset in range(1, max(1, window) + 1):
-        if offset >= seq_len:
-            break
-        # cosine similarity between token t and token (t - offset)
-        sim = (x_unit[:, offset:, :] * x_unit[:, :-offset, :]).sum(dim=-1)  # [B, S-offset]
-        # redundancy is symmetric: both tokens in the pair are "duplicates"
-        redundancy[:, offset:] = torch.maximum(redundancy[:, offset:], sim)
-        redundancy[:, :-offset] = torch.maximum(redundancy[:, :-offset], sim)
-
-    # --- Composite information score ---
-    info = (
-        w_norm * _robust_normalize(norm)
-        + w_entropy * _robust_normalize(neg_entropy)
-        + w_variance * _robust_normalize(variance)
-        - w_redundancy * _robust_normalize(redundancy)
-    )
-    return info
 
 # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->DeepseekV2
 class DeepseekV2FlashAttention2(DeepseekV2Attention):
