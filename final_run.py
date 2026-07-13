@@ -42,6 +42,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -89,6 +90,47 @@ CONFIGS: List[Dict[str, Any]] = [
      "score_layers": [4, 6, 8, 12, 16], "cov_floor": 0.90, "pool_ratio": 0},
 ]
 
+# ── Ablation configurations ───────────────────────────────────────────────────
+# Each ablation isolates exactly ONE design choice vs the full committee_c90.
+#
+#   Ablation A  (soft eviction)    : committee_hard_c90 is already in CONFIGS;
+#                                    reused here for the joint ablation table.
+#   Ablation B  (adaptive budget)  : fixed_ratio_70  — knee disabled, exact 70%
+#                                    compare vs committee_c90 to show knee value
+#   Ablation C  (committee)        : single_L6 / single_L12
+#                                    single layer, no averaging, same c90 floor
+#   Ablation D  (cross-layer share): oracle_approx — score per layer independently
+#                                    (approximated by decision_layer=6 with no
+#                                    retroactive pruning; real Oracle is the PPL
+#                                    eval's Config D in eval_layer_decision.py)
+ABLATION_CONFIGS: List[Dict[str, Any]] = [
+    # Reference: full algorithm and baseline
+    {"name": "baseline",
+     "eviction": False,  "decision_layer": 16,
+     "score_layers": [16], "cov_floor": 1.00, "pool_ratio": 0},
+    {"name": "committee_c90",           # full system (reference)
+     "eviction": True,   "decision_layer": 16,
+     "score_layers": [4, 6, 8, 12, 16], "cov_floor": 0.90, "pool_ratio": 4},
+    # Ablation A: isolate soft eviction (super tokens)
+    {"name": "hard_evict_c90",          # same as committee_hard_c90
+     "eviction": True,   "decision_layer": 16,
+     "score_layers": [4, 6, 8, 12, 16], "cov_floor": 0.90, "pool_ratio": 0},
+    # Ablation B: isolate adaptive budget (knee detection)
+    # min_keep == max_keep == 0.70  →  clamps to exactly 70%, bypasses knee
+    {"name": "fixed_ratio_70",
+     "eviction": True,   "decision_layer": 16,
+     "score_layers": [4, 6, 8, 12, 16], "cov_floor": 0.90,
+     "min_keep": 0.70,   "max_keep": 0.70,   "pool_ratio": 4},
+    # Ablation C-1: isolate committee (single layer L6, same coverage floor)
+    {"name": "single_L6",
+     "eviction": True,   "decision_layer": 6,
+     "score_layers": [6],                "cov_floor": 0.90, "pool_ratio": 4},
+    # Ablation C-2: isolate committee (single layer L12)
+    {"name": "single_L12",
+     "eviction": True,   "decision_layer": 12,
+     "score_layers": [12],               "cov_floor": 0.90, "pool_ratio": 4},
+]
+
 # Eviction hyper-parameters (defaults; per-config values override via cfg key)
 COVERAGE_FLOOR   = 0.90
 MIN_KEEP         = 0.30
@@ -103,11 +145,11 @@ DTYPE            = torch.bfloat16
 _DEFAULTS = dict(
     n_ppl_seqs   = 20,
     n_niah_seeds = 3,
-    niah_lengths = [2048, 4096, 8192],
+    niah_lengths = [2048, 4096, 6144, 8192, 16384],
     niah_depths  = [0.25, 0.50, 0.75],
     n_humaneval  = 20,
     n_longbench  = 10,
-    sys_lengths  = [1024, 2048, 4096, 8192],
+    sys_lengths  = [1024, 2048, 4096, 6144, 8192, 12288],
 )
 
 
@@ -119,10 +161,20 @@ def parse_args() -> argparse.Namespace:
                    help="Reduce all subset sizes for a fast smoke test (~15 min)")
     p.add_argument("--skip-optional", action="store_true",
                    help="Skip HumanEval and LongBench (no extra packages needed)")
-    p.add_argument("--niah-max",      type=int, default=8192,
-                   help="Max NIAH context length (default 8192; 32768 for full test)")
+    p.add_argument("--niah-max",      type=int, default=16384,
+                   help="Max NIAH context length (default 16384; 32768 for extended test)")
     p.add_argument("--save",          default="eval_results.json",
                    help="Output JSON path (default: eval_results.json)")
+    p.add_argument("--ablation",      action="store_true",
+                   help="Run ablation study configs (ABLATION_CONFIGS) instead of "
+                        "main CONFIGS. Isolates super-token, knee-detection, and "
+                        "committee contributions individually.")
+    p.add_argument("--only",          default="",
+                   help="Comma-separated list of experiment numbers to run "
+                        "(e.g. --only 5,6 runs only LongBench and System metrics). "
+                        "Valid values: 1=PPL, 2=NIAH, 3=CodeRecall, "
+                        "4=HumanEval, 5=LongBench, 6=System. "
+                        "Default: run all experiments.")
     return p.parse_args()
 
 
@@ -147,13 +199,28 @@ def load_model() -> Tuple[Any, Any]:
     print("[ Loading tokenizer ... ]")
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     print("[ Loading model (device_map=auto) ... ]")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR,
-        trust_remote_code=True,
-        torch_dtype=DTYPE,
-        device_map="auto",
-        attn_implementation="eager",
-    )
+    # "sdpa" uses PyTorch's scaled_dot_product_attention which computes
+    # attention in tiles and never materialises the full O(n²) score matrix,
+    # cutting peak VRAM by ~8 GB at 8k context vs "eager".
+    # Fall back to "eager" only if the model's custom code does not support sdpa.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_DIR,
+            trust_remote_code=True,
+            torch_dtype=DTYPE,
+            device_map="auto",
+            attn_implementation="sdpa",
+        )
+        print("[ Attention: sdpa (memory-efficient) ]")
+    except (ValueError, NotImplementedError):
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_DIR,
+            trust_remote_code=True,
+            torch_dtype=DTYPE,
+            device_map="auto",
+            attn_implementation="eager",
+        )
+        print("[ Attention: eager (sdpa not supported by this model) ]")
     model.eval()
     return tok, model
 
@@ -171,10 +238,10 @@ def configure_model(model, cfg: dict) -> int:
         module.latent_eviction                = cfg["eviction"]
         module.latent_eviction_decision_layer = cfg["decision_layer"]
         module.latent_eviction_window         = EVICTION_WINDOW
-        # Knee-detection budget
+        # Knee-detection budget  (per-config min/max_keep override for ablations)
         module.latent_eviction_coverage_floor = cfg.get("cov_floor", COVERAGE_FLOOR)
-        module.latent_eviction_min_keep       = MIN_KEEP
-        module.latent_eviction_max_keep       = MAX_KEEP
+        module.latent_eviction_min_keep       = cfg.get("min_keep",  MIN_KEEP)
+        module.latent_eviction_max_keep       = cfg.get("max_keep",  MAX_KEEP)
         # Multi-layer committee scoring
         module.latent_eviction_score_layers   = cfg.get("score_layers", SCORE_LAYERS)
         # Soft eviction: super tokens (pool_ratio=0 disables)
@@ -485,23 +552,51 @@ def _build_niah_prompt(tokenizer, target_len: int, needle_val: int,
                         ) -> Tuple[torch.Tensor, str]:
     """
     Build a token sequence of ~target_len with a secret integer constant
-    buried at relative position `depth`.  Returns (ids [1,N], str(needle_val)).
+    buried at relative position `depth` among several decoys.
+    Returns (ids [1,N], str(needle_val)).
     """
-    filler   = _get_filler_ids(tokenizer, target_len + 200)
-    pre_len  = max(1, int(target_len * depth))
-    post_len = max(1, target_len - pre_len - 40)
+    import random
+    # Generate 5 decoy values (avoid collisions with needle)
+    decoys = []
+    while len(decoys) < 5:
+        d = random.randint(10000, 99999)
+        if d != needle_val and d not in decoys:
+            decoys.append(d)
+    
+    # Build needle section with clear label + decoys
+    needle_str = (
+        "\n# ===== REAL ANSWER =====\n"
+        f"SECRET_CONSTANT = {needle_val}\n"
+        "# ===== END REAL ANSWER =====\n"
+        "\n# Decoy values (do NOT use):\n"
+        f"CACHE_SIZE = {decoys[0]}\n"
+        f"BUFFER_LENGTH = {decoys[1]}\n"
+        f"MAX_RETRIES = {decoys[2]}\n"
+        f"TIMEOUT_MS = {decoys[3]}\n"
+        f"VERSION = {decoys[4]}\n"
+    )
+    question_str = (
+        "\n\nQuestion: What is the value of SECRET_CONSTANT (the REAL ANSWER)?\n"
+        "Ignore all the decoy constants above (CACHE_SIZE, BUFFER_LENGTH, etc).\n"
+        "Answer with ONLY the integer value of SECRET_CONSTANT, nothing else.\n"
+        "Answer: "
+    )
 
-    pre_ids  = filler[:pre_len]
-    post_ids = filler[pre_len: pre_len + post_len]
-
-    needle_str   = f"\nSECRET_CONSTANT = {needle_val}  # injected needle\n"
-    question_str = ("\n# ----------------------------------------\n"
-                    f"# Q: What is the value of SECRET_CONSTANT?\n"
-                    f"# A: SECRET_CONSTANT = ")
-
-    needle_ids   = tokenizer(needle_str,   return_tensors="pt").input_ids[0]
+    needle_ids = tokenizer(needle_str, return_tensors="pt").input_ids[0]
     question_ids = tokenizer(question_str, return_tensors="pt").input_ids[0]
 
+    # Keep final token count near target_len to avoid accidental overflow effects.
+    # Reserve space for needle + question, and fill remaining budget with code filler.
+    reserved = needle_ids.shape[0] + question_ids.shape[0]
+    filler_budget = max(8, target_len - reserved)
+    filler = _get_filler_ids(tokenizer, filler_budget + 64)
+
+    pre_len = max(1, int(filler_budget * depth))
+    pre_len = min(pre_len, filler_budget - 1)
+    post_len = max(1, filler_budget - pre_len)
+
+    pre_ids = filler[:pre_len]
+    post_ids = filler[pre_len: pre_len + post_len]
     ids = torch.cat([pre_ids, needle_ids, post_ids, question_ids]).unsqueeze(0)
     return ids.to(device), str(needle_val)
 
@@ -509,10 +604,32 @@ def _build_niah_prompt(tokenizer, target_len: int, needle_val: int,
 @torch.no_grad()
 def _niah_one(model, tokenizer, ctx_ids: torch.Tensor,
               expected: str, max_new: int = 20) -> bool:
-    gen    = _greedy_gen(model, tokenizer, ctx_ids, max_new)
-    answer = tokenizer.decode(gen[0, ctx_ids.shape[1]:],
-                               skip_special_tokens=True).strip()
-    return expected in answer
+    gen = _greedy_gen(model, tokenizer, ctx_ids, max_new)
+    answer = tokenizer.decode(
+        gen[0, ctx_ids.shape[1]:], skip_special_tokens=True
+    ).strip()
+
+    expected_norm = re.sub(r"[^0-9]", "", expected)
+    
+    # STRICT matching mode: require "Answer:" prefix or very first number
+    # Strategy 1: Look for explicit "Answer: <number>" pattern
+    m = re.search(r'[Aa]nswer[:\s]*([\d,]+)', answer[:100])  # search first 100 chars
+    if m:
+        parsed = re.sub(r"[^0-9]", "", m.group(1))
+        if parsed == expected_norm:
+            return True
+    
+    # Strategy 2: If no "Answer" prefix found, only accept standalone number
+    # (not embedded in variable/constant names)
+    # Extract first standalone number sequence
+    tokens = re.findall(r'\b\d+\b', answer)  # word-boundary numbers
+    if tokens:
+        first_num = re.sub(r"[^0-9]", "", tokens[0])
+        if first_num == expected_norm:
+            return True
+    
+    # Strict: if we can't extract a clean number with prefix, fail
+    return False
 
 
 def run_niah(model, tokenizer, args, scale: dict) -> Dict:
@@ -536,7 +653,7 @@ def run_niah(model, tokenizer, args, scale: dict) -> Dict:
                     try:
                         ctx, exp = _build_niah_prompt(
                             tokenizer, ctx_len, nv, depth, device)
-                        hit       = _niah_one(model, tokenizer, ctx, exp)
+                        hit = _niah_one(model, tokenizer, ctx, exp, max_new=48)
                         correct  += int(hit)
                     except Exception:
                         pass
@@ -776,14 +893,43 @@ def run_longbench(model, tokenizer, args, scale: dict) -> Optional[Dict]:
     print("  [5/6] LongBench multi-doc QA  (optional)")
     print("─" * 68)
 
-    try:
-        from datasets import load_dataset
-        ds      = load_dataset("THUDM/LongBench", "multifieldqa_en",
-                               split="test", trust_remote_code=True)
-        samples = list(ds)[:scale["n_longbench"]]
-        print(f"  Loaded LongBench multifieldqa_en ({len(samples)} samples)")
-    except Exception as e:
-        print(f"  [SKIP] LongBench unavailable: {e}")
+    samples = None
+    _LB_CONFIGS = ["multifieldqa_en", "hotpotqa", "2wikimqa", "qasper"]
+
+    # Strategy 1: try standard parquet loading (no loading script needed)
+    for cfg_name in _LB_CONFIGS:
+        if samples is not None:
+            break
+        for load_kwargs in [
+            # Try name= param without trust_remote_code
+            {"path": "THUDM/LongBench", "name": cfg_name,
+             "split": "test", "trust_remote_code": False},
+            # Try direct parquet via HF hub URL
+            {"path": "parquet",
+             "data_files": f"hf://datasets/THUDM/LongBench/data/{cfg_name}-00000-of-00001.parquet",
+             "split": "train"},
+            {"path": "parquet",
+             "data_files": f"hf://datasets/THUDM/LongBench/data/{cfg_name}_e-00000-of-00001.parquet",
+             "split": "train"},
+        ]:
+            try:
+                from datasets import load_dataset
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    ds = load_dataset(**load_kwargs)
+                candidates = list(ds)[:scale["n_longbench"]]
+                if candidates:
+                    samples = candidates
+                    print(f"  Loaded LongBench {cfg_name} ({len(samples)} samples)")
+                    break
+            except Exception:
+                continue
+
+    if samples is None:
+        print("  [SKIP] LongBench unavailable (all loading strategies failed).")
+        print("         The THUDM/LongBench dataset no longer supports loading scripts.")
+        print("         Check https://huggingface.co/datasets/THUDM/LongBench for ")
+        print("         updated parquet file paths.")
         return None
 
     def _f1(pred: str, gold: str) -> float:
@@ -862,32 +1008,48 @@ def _sys_measure(model, tokenizer, n_tokens: int) -> Optional[Dict]:
         print("    [SKIP] CPU-only: skipping VRAM metrics")
         return None
 
-    ids = tokenizer(_SYS_CODE, return_tensors="pt").input_ids[:, :n_tokens].to(dev)
+    # Tokenise with truncation to suppress length-overflow warning
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ids = tokenizer(
+            _SYS_CODE, return_tensors="pt",
+            truncation=True, max_length=n_tokens + 10,
+        ).input_ids[:, :n_tokens].to(dev)
     actual = ids.shape[1]
     if actual < 128:
         return None
 
-    # Prefill
+    attn_mask = torch.ones_like(ids)   # explicit mask prevents AssertionError
+
+    # Prefill — pass explicit DynamicCache so eviction triggers (requires
+    # past_key_value.get_seq_length() == 0 at first-prefill detection)
     torch.cuda.reset_peak_memory_stats(dev)
     torch.cuda.synchronize(dev)
     t0 = time.perf_counter()
     with torch.no_grad():
-        out = model(ids, use_cache=True)
+        if _HAS_DYNAMIC_CACHE:
+            out = model(ids, attention_mask=attn_mask,
+                        past_key_values=_DynamicCache(), use_cache=True)
+        else:
+            out = model(ids, attention_mask=attn_mask, use_cache=True)
     torch.cuda.synchronize(dev)
     prefill_ms  = (time.perf_counter() - t0) * 1000
     peak_vram   = torch.cuda.max_memory_allocated(dev) / 1024**3
 
     # TTFT: decode one token from the post-eviction cache
     past_kv  = out.past_key_values
+    kept     = _cache_len(past_kv)          # actual cache length after eviction
     dummy    = ids[:, -1:]
+    # mask size must be (batch, kept_cache + 1 new token), NOT original input length
+    dummy_mask = torch.ones(ids.shape[0], kept + 1, device=dev, dtype=torch.long)
     torch.cuda.synchronize(dev)
     t1 = time.perf_counter()
     with torch.no_grad():
-        model(dummy, past_key_values=past_kv, use_cache=True)
+        model(dummy, past_key_values=past_kv,
+              attention_mask=dummy_mask, use_cache=True)
     torch.cuda.synchronize(dev)
     ttft_ms = (time.perf_counter() - t1) * 1000
 
-    kept     = _cache_len(past_kv)
     compress = kept / actual if actual > 0 else 1.0
 
     del out, past_kv
@@ -919,6 +1081,9 @@ def run_system(model, tokenizer, args, scale: dict) -> Dict:
         configure_model(model, cfg)
         cfg_res: Dict[str, Any] = {}
         for n in scale["sys_lengths"]:
+            # Clear GPU cache before each measurement to avoid OOM cascade
+            gc.collect()
+            torch.cuda.empty_cache()
             try:
                 m = _sys_measure(model, tokenizer, n)
                 if m:
@@ -930,11 +1095,155 @@ def run_system(model, tokenizer, args, scale: dict) -> Dict:
                         f"{m['ttft_ms']:>8.1f}  "
                         f"{m['peak_vram_gb']:>7.2f}"
                     )
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as oom:
+                msg = str(oom)[:60].replace("\n", " ")
+                print(f"  {cfg['name']:12}  {n:6d}  OOM — {msg}")
+                gc.collect()
+                torch.cuda.empty_cache()
+                break   # larger lengths will also OOM for this config
             except Exception as e:
-                print(f"  {cfg['name']:12}  {n:6d}  ERROR: {e}")
+                print(f"  {cfg['name']:12}  {n:6d}  "
+                      f"ERROR ({type(e).__name__}): {str(e)[:80]}")
+                gc.collect()
+                torch.cuda.empty_cache()
         results[cfg["name"]] = cfg_res
 
     return results
+
+
+# ── System metrics chart ─────────────────────────────────────────────────────
+def _plot_system_metrics(system_results: Dict, save_path: str = "system_metrics.pdf") -> None:
+    """
+    Single combined chart: all four metrics on one axes, normalized to baseline.
+    X-axis: context lengths.  Each metric uses a distinct marker shape.
+    Each config uses a distinct colour.  Y-axis: ratio vs baseline (1.0 = baseline).
+    Requires matplotlib; gracefully skips if not installed.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import matplotlib.lines as mlines
+    except ImportError:
+        print("  [SKIP chart] matplotlib not found.  "
+              "Install with: pip install matplotlib")
+        return
+
+    # (data_key, legend_label, marker)
+    METRIC_DEFS = [
+        ("compress_ratio", "Compress Ratio", "o"),   # circle
+        ("prefill_ms",     "Prefill (ms)",   "^"),   # triangle
+        ("peak_vram_gb",   "VRAM (GB)",      "s"),   # square
+        ("ttft_ms",        "TTFT (ms)",      "D"),   # diamond
+    ]
+
+    # Collect sorted context-length keys
+    ctx_keys: set = set()
+    for cfg_data in system_results.values():
+        ctx_keys.update(cfg_data.keys())
+    ctx_lengths = sorted(ctx_keys, key=lambda x: int(x) if str(x).isdigit() else 0)
+    if not ctx_lengths:
+        print("  [SKIP chart] No system data available.")
+        return
+
+    config_names = list(system_results.keys())
+    baseline_data = system_results.get("baseline", {})
+    x_pos    = list(range(len(ctx_lengths)))
+    x_labels = [str(c) for c in ctx_lengths]
+    # High-contrast palette: maximally distinct hues
+    colors = [
+        "#E63946",  # vivid red
+        "#2196F3",  # bright blue
+        "#4CAF50",  # green
+        "#7B1FA2",  # purple
+        "#9C27B0",  # purple
+        "#00BCD4",  # cyan
+        "#F06292",  # pink
+        "#8BC34A",  # lime
+    ]
+
+    fig, ax = plt.subplots(figsize=(13, 7))
+    fig.suptitle(
+        "System Metrics — DeepSeek Latent Eviction  (normalized to baseline)",
+        fontsize=13, fontweight="bold",
+    )
+
+    # Horizontal reference line at 1.0
+    ax.axhline(1.0, color="#888888", linestyle=":", linewidth=1.2, alpha=0.8)
+    ax.text(len(ctx_lengths) - 0.52, 1.015, "baseline",
+            color="#888888", fontsize=8, ha="right", va="bottom")
+
+    for ci, cfg_name in enumerate(config_names):
+        cfg_data  = system_results[cfg_name]
+        linestyle = "--" if cfg_name == "baseline" else "-"
+        for metric_key, _, marker in METRIC_DEFS:
+            xs, ys = [], []
+            for xi, ctx in enumerate(ctx_lengths):
+                v = cfg_data.get(ctx, {}).get(metric_key)
+                b = baseline_data.get(ctx, {}).get(metric_key)
+                if v is not None and b is not None and float(b) != 0.0:
+                    xs.append(xi)
+                    ys.append(float(v) / float(b))
+            if ys:
+                ax.plot(xs, ys,
+                        marker=marker, markersize=9, linewidth=1.8,
+                        linestyle=linestyle,
+                        color=colors[ci % len(colors)],
+                        alpha=0.88)
+
+    # ── Legend (two groups: configs by colour, metrics by marker) ─────────
+    config_handles = [
+        mlines.Line2D([], [], color=colors[ci % len(colors)], linewidth=2.2,
+                      linestyle="--" if name == "baseline" else "-",
+                      label=name)
+        for ci, name in enumerate(config_names)
+    ]
+    metric_handles = [
+        mlines.Line2D([], [], color="#333333", marker=mk, linestyle="None",
+                      markersize=9, label=label)
+        for _, label, mk in METRIC_DEFS
+    ]
+    leg_cfg = ax.legend(handles=config_handles, title="Config",
+                        loc="lower left",  fontsize=8, title_fontsize=9,
+                        framealpha=0.9)
+    ax.add_artist(leg_cfg)
+    ax.legend(handles=metric_handles,  title="Metric",
+              loc="lower right", fontsize=8, title_fontsize=9,
+              framealpha=0.9)
+
+    ax.set_xlabel("Context Length (tokens)", fontsize=11)
+    ax.set_ylabel("Ratio vs Baseline", fontsize=11)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_labels)
+    ax.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    # Auto-fit y range: centre curves with padding, always include 1.0
+    all_ys = []
+    for ci, cfg_name in enumerate(config_names):
+        cfg_data = system_results[cfg_name]
+        for metric_key, _, _ in METRIC_DEFS:
+            for ctx in ctx_lengths:
+                v = cfg_data.get(ctx, {}).get(metric_key)
+                b = baseline_data.get(ctx, {}).get(metric_key)
+                if v is not None and b is not None and float(b) != 0.0:
+                    all_ys.append(float(v) / float(b))
+    if all_ys:
+        data_min, data_max = min(all_ys), max(all_ys)
+        span    = max(data_max - data_min, 0.1)
+        pad     = span * 0.35
+        y_lo    = max(0.0, data_min - pad)
+        y_hi    = max(data_max + pad, 1.0 + pad * 0.5)
+        ax.set_ylim(y_lo, y_hi)
+    else:
+        ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  System metrics chart -> {save_path}")
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -963,9 +1272,12 @@ def print_summary(all_results: Dict) -> None:
         row("Suffix PPL",
             [_fmt(all_results["ppl"].get(n, {}).get("suffix_ppl")) for n in names])
 
-    # 2. NIAH per context length
+    # 2. NIAH per context length (dynamic; supports custom grids such as 6k)
     if "niah" in all_results:
-        for ctx in ["2048", "4096", "8192"]:
+        ctx_keys = set()
+        for n in names:
+            ctx_keys.update(all_results["niah"].get(n, {}).keys())
+        for ctx in sorted(ctx_keys, key=lambda x: int(x) if str(x).isdigit() else 10**9):
             vals = []
             for n in names:
                 r   = all_results["niah"].get(n, {}).get(ctx, {})
@@ -1011,12 +1323,37 @@ def main() -> None:
     args  = parse_args()
     sc    = _scale(args)
 
+    # ── Select config set: main evaluation vs ablation study ─────────────────
+    global CONFIGS
+    if args.ablation:
+        CONFIGS = ABLATION_CONFIGS
+        mode_label = "Ablation Study"
+        save_default = args.save.replace(".json", "_ablation.json")
+        if args.save == "eval_results.json":   # user did not override --save
+            args.save = save_default
+    else:
+        mode_label = "Main Evaluation"
+
     print("\n" + "=" * 68)
     print("  DeepSeek-Coder-V2-Lite  --  Latent Eviction Evaluation")
+    print(f"  Mode       : {mode_label}")
     print(f"  Configs    : {[c['name'] for c in CONFIGS]}")
     print(f"  Quick mode : {args.quick}")
     print(f"  NIAH max   : {args.niah_max} tokens")
+    if args.only:
+        print(f"  Only exps  : {args.only}")
     print("=" * 68)
+
+    # Parse --only into a set of ints; empty set = run all
+    _only: set = set()
+    if args.only.strip():
+        for tok_str in args.only.split(","):
+            tok_str = tok_str.strip()
+            if tok_str.isdigit() and 1 <= int(tok_str) <= 6:
+                _only.add(int(tok_str))
+            else:
+                print(f"  [WARN] Unknown experiment id '{tok_str}' in --only, skipping.")
+    _run = lambda n: (not _only) or (n in _only)
 
     tok, model = load_model()
 
@@ -1035,19 +1372,27 @@ def main() -> None:
 
     all_results: Dict[str, Any] = {}
 
-    all_results["ppl"]         = run_ppl(model, tok, args, sc)
-    all_results["niah"]        = run_niah(model, tok, args, sc)
-    all_results["code_recall"] = run_code_recall(model, tok, args, sc)
+    if _run(1):
+        all_results["ppl"]         = run_ppl(model, tok, args, sc)
+    if _run(2):
+        all_results["niah"]        = run_niah(model, tok, args, sc)
+    if _run(3):
+        all_results["code_recall"] = run_code_recall(model, tok, args, sc)
 
     if not args.skip_optional:
-        he = run_humaneval(model, tok, args, sc)
-        if he:
-            all_results["humaneval"] = he
-        lb = run_longbench(model, tok, args, sc)
-        if lb:
-            all_results["longbench"] = lb
+        if _run(4):
+            he = run_humaneval(model, tok, args, sc)
+            if he:
+                all_results["humaneval"] = he
+        if _run(5):
+            lb = run_longbench(model, tok, args, sc)
+            if lb:
+                all_results["longbench"] = lb
 
-    all_results["system"] = run_system(model, tok, args, sc)
+    if _run(6):
+        all_results["system"] = run_system(model, tok, args, sc)
+        chart_path = args.save.replace(".json", "_system.pdf")
+        _plot_system_metrics(all_results["system"], save_path=chart_path)
 
     print_summary(all_results)
 

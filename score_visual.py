@@ -641,10 +641,10 @@ def plot_grid(results):
         fontsize=9, y=1.005,
     )
     fig.tight_layout(rect=[0, 0, 1, 1])
-    out = os.path.join(MODEL_DIR, "score_distributions.png")
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    out = os.path.join(MODEL_DIR, "score_distributions.pdf")
+    fig.savefig(out, format="pdf", bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved → score_distributions.png")
+    print(f"  Saved → score_distributions.pdf")
 
 
 def plot_overlay(results):
@@ -690,10 +690,10 @@ def plot_overlay(results):
         fontsize=9,
     )
     fig.tight_layout()
-    out = os.path.join(MODEL_DIR, "score_overlay.png")
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    out = os.path.join(MODEL_DIR, "score_overlay.pdf")
+    fig.savefig(out, format="pdf", bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved → score_overlay.png")
+    print(f"  Saved → score_overlay.pdf")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
