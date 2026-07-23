@@ -835,6 +835,13 @@ class DeepseekV2Attention(nn.Module):
         # Memory: O(K × n) vs O(n²).  32k @ K=512 ≈ 1 GB;  128k @ K=512 ≈ 4 GB.
         # Lower K to 128–256 if GPU memory is tight; higher K for less rank noise.
         self.latent_eviction_score_queries   = 512  # Max query rows used for scoring
+        # ---- Eviction mode selector -----------------------------------------
+        # "committee" : multi-layer committee scoring + soft eviction (default)
+        # "streaming" : StreamingLLM — first n_sink + recent window
+        # "h2o"       : Heavy-Hitter Oracle — per-layer attention-score ranking
+        self.latent_eviction_mode               = "committee"
+        self.latent_eviction_keep_ratio         = 0.50  # target keep fraction (streaming/h2o)
+        self.latent_eviction_h2o_recent_ratio   = 0.10  # h2o: recent tokens always kept
         # -----------------------------------------------------------------------
 
 
@@ -1160,6 +1167,98 @@ class DeepseekV2Attention(nn.Module):
         )
         return keep_idx
 
+    # ------------------------------------------------------------------
+    # Alternative eviction modes (streaming / h2o)
+    # ------------------------------------------------------------------
+
+    def _streaming_keep_indices(
+        self, seq_len: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """
+        StreamingLLM keep-index set: first n_sink (attention sinks) +
+        last window_size (recent) tokens.  Returns a 1-D sorted index
+        tensor of shape [n_keep], or None if no eviction is needed.
+        keep_ratio is read from self.latent_eviction_keep_ratio.
+        """
+        n_sink = min(self.latent_eviction_sink_tokens, seq_len)
+        keep_ratio = getattr(self, 'latent_eviction_keep_ratio', 0.50)
+        n_keep = max(n_sink + 1, int(seq_len * keep_ratio))
+        if n_keep >= seq_len:
+            return None
+        window = max(1, n_keep - n_sink)
+        sink_idx   = torch.arange(n_sink,              device=device)
+        recent_idx = torch.arange(seq_len - window, seq_len, device=device)
+        return torch.cat([sink_idx, recent_idx])   # already sorted
+
+    def _h2o_keep_indices(
+        self,
+        q_abs:         torch.Tensor,   # [B, H, q_len, kv_lora_rank]
+        q_pe:          torch.Tensor,   # [B, H, q_len, qk_rope_head_dim]
+        cached_latent: torch.Tensor,   # [B, 1, S, kv_lora_rank]
+        cached_kpe:    torch.Tensor,   # [B, 1, S, qk_rope_head_dim]
+    ) -> Optional[torch.Tensor]:
+        """
+        H2O Heavy-Hitter Oracle keep-index set.
+
+        Computes the full attention weight matrix for the prefill pass,
+        accumulates scores by summing attention weights over all query
+        positions (approximated with at most latent_eviction_score_queries
+        query rows to bound memory), then keeps the top n_heavy tokens
+        plus the most recent n_recent tokens unconditionally.
+
+        Returns a 1-D sorted index tensor [n_keep] or None.
+        """
+        S = cached_latent.shape[2]
+        keep_ratio   = getattr(self, 'latent_eviction_keep_ratio', 0.50)
+        recent_ratio = getattr(self, 'latent_eviction_h2o_recent_ratio', 0.10)
+        n_keep   = max(2, int(S * keep_ratio))
+        n_recent = max(1, int(S * recent_ratio))
+        n_recent = min(n_recent, n_keep - 1)
+        if n_keep >= S:
+            return None
+
+        # Subsample from the END of the sequence (these queries have seen
+        # the most context and produce the most representative scores).
+        max_q = getattr(self, 'latent_eviction_score_queries', 512)
+        q_len  = q_abs.shape[2]
+        if q_len > max_q:
+            q_start  = q_len - max_q
+            q_abs_s  = q_abs[:, :, q_start:, :]
+            q_pe_s   = q_pe[:,  :, q_start:, :]
+        else:
+            q_start  = 0
+            q_abs_s  = q_abs
+            q_pe_s   = q_pe
+
+        # Attention logits [B, H, n_q, S]
+        content = torch.matmul(q_abs_s, cached_latent.transpose(-1, -2))
+        rope    = torch.matmul(q_pe_s,  cached_kpe.transpose(-1, -2))
+        scores  = (content + rope) * self.softmax_scale
+
+        # Causal mask: query at global position (q_start + i) can only attend
+        # to keys 0 .. (q_start + i).
+        n_q = q_abs_s.shape[2]
+        row_pos = torch.arange(q_start, q_start + n_q,
+                               device=scores.device).unsqueeze(1)   # [n_q, 1]
+        col_pos = torch.arange(S, device=scores.device).unsqueeze(0)  # [1, S]
+        causal_mask = torch.where(
+            col_pos > row_pos,
+            torch.full((1,), float('-inf'), device=scores.device, dtype=scores.dtype),
+            torch.zeros((1,),               device=scores.device, dtype=scores.dtype),
+        )
+        scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
+
+        # Softmax → sum over query positions → mean over heads → [S]
+        attn_w     = torch.softmax(scores.float(), dim=-1).to(q_abs.dtype)
+        importance = attn_w.sum(dim=2).mean(dim=1)   # [B, S]
+        importance = importance[0] if importance.shape[0] > 1 else importance.squeeze(0)
+
+        # Protect recent tokens from being evicted
+        importance[-n_recent:] = float('inf')
+
+        _, keep_idx = importance.topk(n_keep)
+        return keep_idx.sort().values   # maintain positional order
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1287,7 +1386,8 @@ class DeepseekV2Attention(nn.Module):
                 score_layers = set(getattr(self, 'latent_eviction_score_layers', [D]))
 
                 # ── 委员会层：计算本层 importance scores 并累积 ────────────────
-                if self.layer_idx in score_layers:
+                _eviction_mode = getattr(self, 'latent_eviction_mode', 'committee')
+                if _eviction_mode == 'committee' and self.layer_idx in score_layers:
                     _info_this = self._compute_importance_scores(
                         c_kv_normed, q_abs=q_abs, W_UV=W_UV)
                     if _info_this is not None:
@@ -1298,7 +1398,7 @@ class DeepseekV2Attention(nn.Module):
                 keep_indices = None
 
                 # ── 决策层：聚合委员会分数 → 驱逐 + super tokens ─────────────
-                if self.layer_idx == D:
+                if _eviction_mode == 'committee' and self.layer_idx == D:
                     _scores_list = getattr(past_key_value, '_evict_scores_list', None)
                     if _scores_list:
                         _agg_info = torch.stack(_scores_list, dim=0).mean(dim=0)  # [B, n_mid]
@@ -1340,11 +1440,45 @@ class DeepseekV2Attention(nn.Module):
                         if hasattr(past_key_value, '_evict_scores_list'):
                             del past_key_value._evict_scores_list
 
-                elif self.layer_idx > D:
+                elif _eviction_mode == 'committee' and self.layer_idx > D:
                     keep_indices = getattr(past_key_value, "shared_keep_indices", None)
-                # else: layer_idx < D 且非委员会层 → 稠密写入，keep_indices = None
 
-                if keep_indices is not None:
+                # ── StreamingLLM / H2O: per-layer independent eviction ────────
+                if _eviction_mode == 'streaming':
+                    _s_idx = self._streaming_keep_indices(
+                        cached_latent.shape[2], cached_latent.device)
+                    if _s_idx is not None:
+                        _B   = cached_latent.shape[0]
+                        _sei = _s_idx.view(1, 1, -1, 1)   # [1, 1, n_keep, 1]
+                        _tl  = cached_latent.gather(
+                            2, _sei.expand(_B, 1, -1, cached_latent.shape[-1]))
+                        _tk  = cached_kpe.gather(
+                            2, _sei.expand(_B, 1, -1, cached_kpe.shape[-1]))
+                        past_key_value.key_cache[self.layer_idx]   = _tl
+                        past_key_value.value_cache[self.layer_idx] = _tk
+                        # Do NOT reassign cached_latent/cached_kpe here.
+                        # Current-layer attention still computes over the full prefill
+                        # sequence (consistent with the pre-built causal attention_mask).
+                        # Eviction only takes effect for subsequent decode steps.
+                        if self.layer_idx == self.config.num_hidden_layers - 1:
+                            past_key_value._seen_tokens = _tl.shape[2]
+                elif _eviction_mode == 'h2o':
+                    _h_idx = self._h2o_keep_indices(
+                        q_abs, q_pe, cached_latent, cached_kpe)
+                    if _h_idx is not None:
+                        _B   = cached_latent.shape[0]
+                        _hei = _h_idx.view(1, 1, -1, 1)   # [1, 1, n_keep, 1]
+                        _tl  = cached_latent.gather(
+                            2, _hei.expand(_B, 1, -1, cached_latent.shape[-1]))
+                        _tk  = cached_kpe.gather(
+                            2, _hei.expand(_B, 1, -1, cached_kpe.shape[-1]))
+                        past_key_value.key_cache[self.layer_idx]   = _tl
+                        past_key_value.value_cache[self.layer_idx] = _tk
+                        # Same as streaming: do not touch cached_latent/cached_kpe
+                        # so current-layer attention sees the full prefill sequence.
+                        if self.layer_idx == self.config.num_hidden_layers - 1:
+                            past_key_value._seen_tokens = _tl.shape[2]
+                elif keep_indices is not None:
                     # [核心优化点 4：双轨同步切片（latent + k_pe）+ super tokens]
                     idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B, 1, keep_k, 1]
                     trimmed_latent = cached_latent.gather(
