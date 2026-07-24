@@ -2714,7 +2714,16 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+
+        # After chunked prefill, hidden_states can be 16K+.  lm_head produces
+        # [B, 16K, vocab_size] which is ~3.4 GB in bf16 and ~6.7 GB after .float().
+        # Since prefill logits are never consumed by downstream eval code (only
+        # past_key_values matters), compute lm_head only on the last position.
+        if getattr(self.model, '_did_chunked_prefill', False) and labels is None:
+            logits = self.lm_head(hidden_states[:, -1:, :])
+            self.model._did_chunked_prefill = False
+        else:
+            logits = self.lm_head(hidden_states)
         logits = logits.float()
 
         loss = None
