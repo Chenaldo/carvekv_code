@@ -844,6 +844,17 @@ class DeepseekV2Attention(nn.Module):
         self.latent_eviction_h2o_recent_ratio   = 0.10  # h2o: recent tokens always kept
         # -----------------------------------------------------------------------
 
+        # ---- Chunked prefill control (set by DeepseekV2Model._chunked_forward) ----
+        # _chunked_prefill_active: True while a chunked prefill is in progress.
+        #   Suppresses eviction on intermediate chunks (1..N-1).
+        # _chunked_prefill_final: True only for the LAST chunk. Triggers eviction
+        #   with full-cached_latent scoring + retroactive layer trimming.
+        # _chunked_prefill_total: total number of tokens across all chunks.
+        #   Used by the final chunk to know the full sequence length for sink/recent.
+        self._chunked_prefill_active = False
+        self._chunked_prefill_final  = False
+        self._chunked_prefill_total  = 0
+
 
 ##根据模型的配置，初始化对应的旋转位置编码（Rotary Position Embedding, 简称 RoPE）模块
 ##注意力机制（Attention）本身是无法感知词语先后顺序的，必须通过“位置编码”来告诉模型每个词的位置
@@ -987,9 +998,19 @@ class DeepseekV2Attention(nn.Module):
 
         val_norm = None
         if W_UV is not None:
-            val_proj = torch.einsum("bnr,hdr->bhnd", mid_latent, W_UV).float()
-            val_norm = val_proj.norm(dim=-1).mean(dim=1)              # [B, n_mid]
-            v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+            # Compute val_norm one head at a time to bound peak memory.
+            # The per-head val_proj tensor [B, 1, n_mid, v_head_dim] at 16k is
+            # only ~4 MB.  Looping over heads is slower but keeps the committee
+            # layers from accumulating large intermediate tensors.
+            n_heads = W_UV.shape[0]
+            val_norms: list = []
+            for h in range(n_heads):
+                # matmul: [B, 1, n_mid, R] × [1, v_head_dim, R]^T
+                vp_h = torch.matmul(mid_latent.unsqueeze(1).float(),
+                                    W_UV[h:h+1].float().transpose(-1, -2))
+                val_norms.append(vp_h.squeeze(1).norm(dim=-1))  # [B, n_mid]
+            val_norm = torch.stack(val_norms, dim=1).mean(dim=1)  # [B, n_mid]
+            v_mean  = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
             val_norm = val_norm / v_mean
 
         if q_abs is not None:
@@ -1345,8 +1366,16 @@ class DeepseekV2Attention(nn.Module):
         W_UV = W_kv[:, self.qk_nope_head_dim :, :]  # [H, v_head_dim,       kv_lora_rank]
 
         # q_abs = q_nope @ W_UK  → [B, H, q_len, kv_lora_rank]
-        # 推导：q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
-        q_abs = torch.einsum("bhqd,hdr->bhqr", q_nope, W_UK)
+        # Do this head-by-head via matmul to stay under 16 MB per head at 16k,
+        # instead of einsum("bhqd,hdr->bhqr") which broadcasts to a 5-D
+        # intermediate [B,H,q_len,qk_nope_head_dim,R] → ~34 GB at 16k.
+        q_abs_list = []
+        for h in range(self.num_heads):
+            qh = torch.matmul(q_nope[:, h:h+1, :, :].float(),
+                              W_UK[h:h+1].float().transpose(-1, -2))
+            q_abs_list.append(qh.to(q_nope.dtype))
+        q_abs = torch.cat(q_abs_list, dim=1)
+        del q_abs_list
 
         # ── Update cache: 存 latent（key_cache）和 k_pe（value_cache）───────
         # key_cache   ← c_kv_normed  [B, 1, S, kv_lora_rank=512]
@@ -1420,21 +1449,30 @@ class DeepseekV2Attention(nn.Module):
                         _pool_r  = getattr(self, 'latent_eviction_pool_ratio', 0)
                         _pool_t  = getattr(self, 'latent_eviction_pool_temperature', 0.1)
 
-                        for _prev in range(D):
-                            if len(past_key_value.key_cache) > _prev:
-                                _pl = past_key_value.key_cache[_prev]
-                                _pk = past_key_value.value_cache[_prev]
-                                _tl = _pl.gather(2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1]))
-                                _tk = _pk.gather(2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1]))
-                                if _pool_r > 0:
-                                    _sc, _sk = self._make_super_tokens(
-                                        _pl, _pk, keep_indices, _agg_info,
-                                        _n_sink_d, _n_recent_d, _pool_r, _pool_t)
-                                    if _sc is not None:
-                                        _tl = torch.cat([_tl, _sc],  dim=2)
-                                        _tk = torch.cat([_tk, _sk],  dim=2)
-                                past_key_value.key_cache[_prev]   = _tl
-                                past_key_value.value_cache[_prev] = _tk
+                        # In-place trimming of ALL past layers including the
+                        # decision layer itself — every layer's cache is
+                        # trimmed (or kept as-is if already trimmed before
+                        # the forward pass) so that PyTorch's caching
+                        # allocator can reuse the old, larger storage for
+                        # the trimmed result, avoiding peak doubling.
+                        for _prev in range(len(past_key_value.key_cache)):
+                            _pl = past_key_value.key_cache[_prev]
+                            _pk = past_key_value.value_cache[_prev]
+                            _tl = _pl.gather(2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1]))
+                            _tk = _pk.gather(2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1]))
+                            if _pool_r > 0:
+                                _sc, _sk = self._make_super_tokens(
+                                    _pl, _pk, keep_indices, _agg_info,
+                                    _n_sink_d, _n_recent_d, _pool_r, _pool_t)
+                                if _sc is not None:
+                                    _tl = torch.cat([_tl, _sc],  dim=2)
+                                    _tk = torch.cat([_tk, _sk],  dim=2)
+                            past_key_value.key_cache[_prev]   = _tl
+                            past_key_value.value_cache[_prev] = _tk
+                        # Release the full-length storage referenced by _pl/_pk
+                        del _pl, _pk, _tl, _tk, _ret_idx
+                        if _pool_r > 0 and _sc is not None:
+                            del _sc, _sk
 
                         # 清理临时累积分数
                         if hasattr(past_key_value, '_evict_scores_list'):
@@ -1516,47 +1554,69 @@ class DeepseekV2Attention(nn.Module):
             cached_latent = c_kv_normed_4d  # [B, 1, q_len, kv_lora_rank]
             cached_kpe    = k_pe             # [B, 1, q_len, qk_rope_head_dim]
 
-        # ── 注意力分数 ─────────────────────────────────────────────────────
-        # W_UK / W_UV / q_abs 已在 cache update 前计算完毕（见上方）。
-        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
-        # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
-        content_score = torch.matmul(q_abs, cached_latent.transpose(-1, -2))
-        rope_score    = torch.matmul(q_pe,  cached_kpe.transpose(-1, -2))
-        attn_weights  = (content_score + rope_score) * self.softmax_scale
-        # [B, H, q_len, kv_seq_len]
+        # ── Chunked MLA attention (no O(S²) materialization) ────────────────
+        # MLA decomposes Q·K^T = q_abs·latent^T + q_pe·k_pe^T.  Both terms
+        # produce [B,H,q_len,kv_seq_len] — too large to materialise at 16k+.
+        # We chunk Q into small pieces (CHUNK=16); each score slice is
+        # [B,H,16,kv_seq_len] which stays easily in memory even at 64k.
+        #
+        # All einsum calls have been replaced with torch.matmul to avoid
+        # 5-D broadcast intermediates that can reach tens of gigabytes.
 
-        kv_seq_len = cached_latent.shape[2]  # 以实际 cached_latent 为准
+        kv_seq_len = cached_latent.shape[2]  # actual (possibly evicted) cache length
+        dev        = cached_latent.device
+        CHUNK      = 16  # [B,H,16,S] at 32k bf16 ≈ 17 MB per score matrix
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, "
-                f"but is {attn_weights.size()}"
+        outputs: list = []
+        for _start in range(0, q_len, CHUNK):
+            _end = min(_start + CHUNK, q_len)
+
+            # ── content score  [B, H, chunk_sz, kv_seq_len]
+            content_c = torch.matmul(
+                q_abs[:, :, _start:_end, :],
+                cached_latent.transpose(-1, -2),
             )
-        assert attention_mask is not None
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, "
-                    f"but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+            # ── rope score  [B, H, chunk_sz, kv_seq_len]
+            rope_c = torch.matmul(
+                q_pe[:, :, _start:_end, :],
+                cached_kpe.transpose(-1, -2),
+            )
+            scores_c = (content_c + rope_c) * self.softmax_scale
+            del content_c, rope_c
 
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(q_nope.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
+            # ── Causal mask ──────────────────────────────────────────────
+            if q_len > 1:
+                col_idx = torch.arange(kv_seq_len, device=dev)
+                row_idx = torch.arange(_start, _end, device=dev)
+                causal  = row_idx.unsqueeze(1) >= col_idx.unsqueeze(0)
+                scores_c = scores_c.masked_fill(
+                    ~causal[None, None], float("-inf"))
 
-        # ── 输出：通过吸收后的 V 权重聚合 ─────────────────────────────────
-        # output = attn @ v = attn @ (W_UV c) = (attn @ c) @ W_UV^T
-        # 先对 latent 做加权求和，再用 W_UV 投影一次，不展开所有 S 个 v 向量。
-        # attn_weights  : [B, H, q_len, kv_seq_len]
-        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
-        weighted_latent = torch.matmul(attn_weights, cached_latent)
-        # [B, H, q_len, kv_lora_rank]
-        attn_output = torch.einsum("bhqr,hdr->bhqd", weighted_latent, W_UV)
-        # [B, H, q_len, v_head_dim]
+            if attention_mask is not None:
+                mask_c = attention_mask[:, :, _start:_end, :kv_seq_len]
+                scores_c = scores_c + mask_c
+
+            # ── softmax → weighted latent → value projection ────────────
+            attn_c  = nn.functional.softmax(scores_c, dim=-1, dtype=torch.float32)
+            attn_c  = attn_c.to(q_nope.dtype)
+            del scores_c
+
+            attn_c          = nn.functional.dropout(attn_c, p=self.attention_dropout, training=self.training)
+            weighted_latent = torch.matmul(attn_c, cached_latent)           # [B,H,chunk,R]
+            del attn_c
+
+            # matmul avoids einsum's 5-D broadcast (up to 2 GB even for a small chunk)
+            # weighted_latent: [B,H,chunk,R]  W_UV: [H,d_v,R]
+            out_c = torch.matmul(weighted_latent, W_UV.transpose(-1, -2))   # [B,H,chunk,d_v]
+            del weighted_latent
+
+            # Move each chunk to CPU to cap GPU memory at one chunk's worth
+            # of output tensors + one score matrix.
+            outputs.append(out_c.cpu())
+
+        attn_output = torch.cat(outputs, dim=2).to(dev)
+        del outputs
+        # attn_output: [B, H, q_len, v_head_dim]
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
