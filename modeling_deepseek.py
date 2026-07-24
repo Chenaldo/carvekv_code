@@ -2456,6 +2456,37 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        # ---- Chunked prefill: split long prefill into 4K chunks ----
+        # Only active when:
+        #   - eager attention (not flash_attn_2 — incompatible K/V layout)
+        #   - use_cache=True
+        #   - first prefill (past_key_values_length == 0, no existing cache)
+        #   - sequence length > CHUNK_SIZE
+        #   - batch_size == 1 (multi-batch would desync cache sizes)
+        CHUNK_SIZE = 4096
+        _do_chunk = (
+            not self._use_flash_attention_2
+            and use_cache
+            and seq_length > CHUNK_SIZE
+            and past_key_values_length == 0
+            and batch_size == 1
+        )
+
+        if _do_chunk:
+            return self._chunked_forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                batch_size=batch_size,
+                seq_length=seq_length,
+                use_legacy_cache=use_legacy_cache,
+            )
+
         if self._use_flash_attention_2:
             # 2d mask is passed through the layers
             attention_mask = (
