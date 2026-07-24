@@ -2270,6 +2270,124 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def _chunked_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.LongTensor,
+        past_key_values,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        batch_size: int,
+        seq_length: int,
+        use_legacy_cache: bool,
+    ):
+        """Chunked prefill: split long sequence into 4K chunks.
+
+        Each chunk flows through ALL decoder layers.  The KV cache accumulates
+        via DynamicCache.update().  Eviction fires only on the final chunk.
+        Peak memory is bounded at 4K-level intermediates regardless of total
+        sequence length.
+        """
+        CHUNK_SIZE = 4096
+        num_chunks = (seq_length + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        # ---- Arm chunked-prefill flags on all attention layers ----
+        for layer in self.layers:
+            layer.self_attn._chunked_prefill_active = True
+            layer.self_attn._chunked_prefill_final  = False
+            layer.self_attn._chunked_prefill_total  = seq_length
+
+        all_hidden_states = []
+        next_decoder_cache = None
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * CHUNK_SIZE
+            chunk_end   = min(chunk_start + CHUNK_SIZE, seq_length)
+            chunk_len   = chunk_end - chunk_start
+
+            # ---- Mark final chunk for eviction trigger ----
+            is_final = (chunk_idx == num_chunks - 1)
+            if is_final:
+                for layer in self.layers:
+                    layer.self_attn._chunked_prefill_final = True
+
+            # ---- Slice inputs for this chunk ----
+            chunk_embeds = inputs_embeds[:, chunk_start:chunk_end, :]
+            chunk_pos_ids = position_ids[:, chunk_start:chunk_end]
+
+            # ---- Build per-chunk 4D causal mask ----
+            # past_key_values_length = chunk_start (tokens already in cache)
+            chunk_attn_mask = _prepare_4d_causal_attention_mask(
+                attention_mask,
+                (batch_size, chunk_len),
+                chunk_embeds,
+                chunk_start,
+            )
+
+            # ---- Run all decoder layers ----
+            hidden_states = chunk_embeds
+            for decoder_layer in self.layers:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=chunk_attn_mask,
+                    position_ids=chunk_pos_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = layer_outputs[0]
+                if use_cache:
+                    next_decoder_cache = layer_outputs[
+                        2 if output_attentions else 1
+                    ]
+
+            all_hidden_states.append(hidden_states)
+
+            # Release chunk intermediates immediately
+            del chunk_embeds, chunk_attn_mask, hidden_states
+
+        # ---- Concatenate chunk outputs ----
+        hidden_states = torch.cat(all_hidden_states, dim=1)
+        del all_hidden_states
+
+        # ---- Clean up chunked-prefill flags ----
+        for layer in self.layers:
+            layer.self_attn._chunked_prefill_active = False
+            layer.self_attn._chunked_prefill_final  = False
+            layer.self_attn._chunked_prefill_total  = 0
+
+        # ---- Apply final layer norm ----
+        hidden_states = self.norm(hidden_states)
+
+        # ---- Signal CausalLM that chunked prefill was used ----
+        # So it can skip full-sequence lm_head to avoid logits.float() OOM.
+        self._did_chunked_prefill = True
+
+        next_cache = None
+        if use_cache:
+            next_cache = (
+                next_decoder_cache.to_legacy_cache()
+                if use_legacy_cache
+                else next_decoder_cache
+            )
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [hidden_states, next_cache, None, None]
+                if v is not None
+            )
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=None,
+            attentions=None,
+        )
+
     @add_start_docstrings_to_model_forward(DeepseekV2_INPUTS_DOCSTRING)
     def forward(
         self,
