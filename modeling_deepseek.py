@@ -1386,12 +1386,26 @@ class DeepseekV2Attention(nn.Module):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
 
+            # ---- Chunked-prefill awareness ----
+            # _chunked_prefill_active: set by DeepseekV2Model._chunked_forward()
+            #   on ALL chunks of a chunked prefill.
+            # _chunked_prefill_final:  set only on the LAST chunk.
+            # _chunked_prefill_total:  total tokens across all chunks.
+            _chunked_active = getattr(self, '_chunked_prefill_active', False)
+            _chunked_final  = getattr(self, '_chunked_prefill_final',  False)
+            _chunked_total  = getattr(self, '_chunked_prefill_total',  0)
+
             # 必须在 update 前检查：update 后本层 cache 必然非空，检查失效
             _is_first_prefill = (
                 q_len > 1
                 and self.latent_eviction
                 and past_key_value.get_seq_length(self.layer_idx) == 0
             )
+
+            # Chunked prefill: suppress eviction on intermediate chunks.
+            # Only the FINAL chunk triggers eviction (with full-cached-latent scoring).
+            if _chunked_active and not _chunked_final:
+                _is_first_prefill = False
 
             # update() 拼接 past + current，返回完整序列的 latent 和 k_pe
             # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]
@@ -1417,8 +1431,16 @@ class DeepseekV2Attention(nn.Module):
                 # ── 委员会层：计算本层 importance scores 并累积 ────────────────
                 _eviction_mode = getattr(self, 'latent_eviction_mode', 'committee')
                 if _eviction_mode == 'committee' and self.layer_idx in score_layers:
-                    _info_this = self._compute_importance_scores(
-                        c_kv_normed, q_abs=q_abs, W_UV=W_UV)
+                    if _chunked_final:
+                        # Final chunk of chunked prefill: score the FULL cached_latent
+                        # using query-free mode (q_abs for the last chunk would bias
+                        # toward recency for earlier tokens).
+                        _full_latent = cached_latent.squeeze(1)  # [B, full_seq_len, R]
+                        _info_this = self._compute_importance_scores(
+                            _full_latent, q_abs=None, W_UV=W_UV)
+                    else:
+                        _info_this = self._compute_importance_scores(
+                            c_kv_normed, q_abs=q_abs, W_UV=W_UV)
                     if _info_this is not None:
                         if not hasattr(past_key_value, '_evict_scores_list'):
                             past_key_value._evict_scores_list = []
@@ -1436,11 +1458,18 @@ class DeepseekV2Attention(nn.Module):
                             c_kv_normed, q_abs=q_abs, W_UV=W_UV)
 
                     if _agg_info is not None:
-                        _n_sink_d   = min(self.latent_eviction_sink_tokens,   q_len)
-                        _n_recent_d = min(self.latent_eviction_recent_tokens,
-                                          max(0, q_len - _n_sink_d))
+                        if _chunked_final:
+                            _total_len  = cached_latent.shape[2]
+                            _n_sink_d   = min(self.latent_eviction_sink_tokens,   _total_len)
+                            _n_recent_d = min(self.latent_eviction_recent_tokens,
+                                              max(0, _total_len - _n_sink_d))
+                        else:
+                            _n_sink_d   = min(self.latent_eviction_sink_tokens,   q_len)
+                            _n_recent_d = min(self.latent_eviction_recent_tokens,
+                                              max(0, q_len - _n_sink_d))
 
-                        keep_indices = self._compute_keep_indices(c_kv_normed, _agg_info)
+                        _c_for_keep = _full_latent if _chunked_final else c_kv_normed
+                        keep_indices = self._compute_keep_indices(_c_for_keep, _agg_info)
                         past_key_value.shared_keep_indices = keep_indices
                         past_key_value._shared_agg_info    = (_agg_info, _n_sink_d, _n_recent_d)
 
