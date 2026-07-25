@@ -1444,12 +1444,14 @@ class DeepseekV2Attention(nn.Module):
                 _eviction_mode = getattr(self, 'latent_eviction_mode', 'committee')
                 if _eviction_mode == 'committee' and self.layer_idx in score_layers:
                     if _chunked_final:
-                        # Final chunk of chunked prefill: score the FULL cached_latent
-                        # using query-free mode (q_abs for the last chunk would bias
-                        # toward recency for earlier tokens).
+                        # Final chunk: score the FULL cached_latent using the
+                        # last chunk's q_abs (the only Q we have).  Some
+                        # recency bias exists, but query-aware scoring gives
+                        # a far more discriminative importance distribution
+                        # than the statistical fallback.
                         _full_latent = cached_latent.squeeze(1)  # [B, full_seq_len, R]
                         _info_this = self._compute_importance_scores(
-                            _full_latent, q_abs=None, W_UV=W_UV)
+                            _full_latent, q_abs=q_abs, W_UV=W_UV)
                     else:
                         _info_this = self._compute_importance_scores(
                             c_kv_normed, q_abs=q_abs, W_UV=W_UV)
