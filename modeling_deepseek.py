@@ -1038,16 +1038,15 @@ class DeepseekV2Attention(nn.Module):
 
             sample_pos  = torch.randperm(q_mid_len, device=device)[:K].sort().values
             q_scored    = q_mid[:, :, sample_pos, :]
-            # Global positions of sampled queries
-            q_global_pos = sample_pos + q_start  # [K]
-            causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
-                           > q_global_pos.unsqueeze(1) - n_sink)
-            # If q_start > n_sink + n_mid (query is fully past mid), no masking needed
 
             attn_logits = torch.matmul(
                 q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
             ) * self.softmax_scale
-            attn_logits = attn_logits.masked_fill(causal_mask[None, None], float("-inf"))
+            # No causal mask: this is a *scoring* function, not attention.
+            # Causal correctness would destroy the score distribution (earlier
+            # mid-tokens get zero attention from all sampled queries), making
+            # knee detection fail and coverage_floor dominate.
+            # Softmax over the full dimension gives a proper importance signal.
             attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
             col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
 
