@@ -53,7 +53,10 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
+try:
+    from transformers.utils.import_utils import is_torch_fx_available
+except ImportError:
+    is_torch_fx_available = lambda: False
 from .configuration_deepseek import DeepseekV2Config
 import torch.distributed as dist
 import numpy as np
@@ -844,6 +847,17 @@ class DeepseekV2Attention(nn.Module):
         self.latent_eviction_h2o_recent_ratio   = 0.10  # h2o: recent tokens always kept
         # -----------------------------------------------------------------------
 
+        # ---- Chunked prefill control (set by DeepseekV2Model._chunked_forward) ----
+        # _chunked_prefill_active: True while a chunked prefill is in progress.
+        #   Suppresses eviction on intermediate chunks (1..N-1).
+        # _chunked_prefill_final: True only for the LAST chunk. Triggers eviction
+        #   with full-cached_latent scoring + retroactive layer trimming.
+        # _chunked_prefill_total: total number of tokens across all chunks.
+        #   Used by the final chunk to know the full sequence length for sink/recent.
+        self._chunked_prefill_active = False
+        self._chunked_prefill_final  = False
+        self._chunked_prefill_total  = 0
+
 
 ##根据模型的配置，初始化对应的旋转位置编码（Rotary Position Embedding, 简称 RoPE）模块
 ##注意力机制（Attention）本身是无法感知词语先后顺序的，必须通过“位置编码”来告诉模型每个词的位置
@@ -987,31 +1001,63 @@ class DeepseekV2Attention(nn.Module):
 
         val_norm = None
         if W_UV is not None:
-            val_proj = torch.einsum("bnr,hdr->bhnd", mid_latent, W_UV).float()
-            val_norm = val_proj.norm(dim=-1).mean(dim=1)              # [B, n_mid]
-            v_mean   = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+            # Compute val_norm one head at a time to bound peak memory.
+            # The per-head val_proj tensor [B, 1, n_mid, v_head_dim] at 16k is
+            # only ~4 MB.  Looping over heads is slower but keeps the committee
+            # layers from accumulating large intermediate tensors.
+            n_heads = W_UV.shape[0]
+            val_norms: list = []
+            for h in range(n_heads):
+                # matmul: [B, 1, n_mid, R] × [1, v_head_dim, R]^T
+                vp_h = torch.matmul(mid_latent.unsqueeze(1).float(),
+                                    W_UV[h:h+1].float().transpose(-1, -2))
+                val_norms.append(vp_h.squeeze(1).norm(dim=-1))  # [B, n_mid]
+            val_norm = torch.stack(val_norms, dim=1).mean(dim=1)  # [B, n_mid]
+            v_mean  = val_norm.mean(dim=-1, keepdim=True).clamp(min=1e-6)
             val_norm = val_norm / v_mean
 
         if q_abs is not None:
-            q_mid = q_abs[:, :, n_sink : seq_len - n_recent, :]
-            K = min(self.latent_eviction_score_queries, n_mid)
-
-            if K < n_mid:
-                sample_pos  = torch.randperm(n_mid, device=device)[:K].sort().values
-                q_scored    = q_mid[:, :, sample_pos, :]
-                causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
-                               > sample_pos.unsqueeze(1))
+            # q_abs may be shorter than compressed_kv (chunked prefill final
+            # chunk: q_abs covers only the last chunk while compressed_kv is
+            # the full sequence).  Use q_abs directly, subsampling K query
+            # positions, and build a causal mask that correctly reflects the
+            # global positions of these queries.
+            q_len = q_abs.shape[2]
+            if q_len > n_mid:
+                # Normal case: q_abs >= n_mid. Slice conventionally.
+                q_mid   = q_abs[:, :, n_sink : seq_len - n_recent, :]
+                q_start = n_sink
             else:
-                q_scored    = q_mid
-                causal_mask = ~torch.tril(
-                    torch.ones(n_mid, n_mid, device=device, dtype=torch.bool))
+                # Mismatched: q_abs is shorter. Use it as-is (it comes from
+                # the END of the sequence). All queries can attend to all
+                # mid tokens since they're past the mid range.
+                q_mid   = q_abs
+                q_start = seq_len - q_len  # global position of first query
+            q_mid_len = q_mid.shape[2]
+            K = min(self.latent_eviction_score_queries, q_mid_len, n_mid)
 
-            attn_logits = torch.matmul(
-                q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
-            ) * self.softmax_scale
-            attn_logits = attn_logits.masked_fill(causal_mask[None, None], float("-inf"))
-            attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
-            col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
+            sample_pos  = torch.randperm(q_mid_len, device=device)[:K].sort().values
+            q_scored    = q_mid[:, :, sample_pos, :]
+
+            # Chunked softmax+sum to bound peak scoring memory.
+            # Monolithic path: [B,H,K,n_mid] float32 → ~2.1 GB at 65k tokens.
+            # Chunked path (K_CHUNK=64): peak ≈ [B,H,64,n_mid] float32 → ~268 MB.
+            # No causal mask: scoring function only; full softmax gives a proper
+            # importance signal and avoids early-mid-token score collapse.
+            mid_latent_t = mid_latent.unsqueeze(1).transpose(-1, -2)  # [B,1,R,n_mid]
+            K_CHUNK = 64
+            n_heads = q_scored.shape[1]
+            col_sum = torch.zeros(bsz, n_heads, n_mid,
+                                  device=device, dtype=torch.float32)
+            for _ki in range(0, K, K_CHUNK):
+                _ke = min(_ki + K_CHUNK, K)
+                _logits = torch.matmul(
+                    q_scored[:, :, _ki:_ke, :], mid_latent_t
+                ) * self.softmax_scale                                 # [B,H,K_CHUNK,n_mid]
+                _probs = torch.softmax(_logits.float(), dim=-1)        # [B,H,K_CHUNK,n_mid]
+                col_sum += _probs.sum(dim=2)                           # [B,H,n_mid]
+                del _logits, _probs
+            del mid_latent_t
 
             if val_norm is not None:
                 info_mid = (col_sum * val_norm.unsqueeze(1)).mean(dim=1)
@@ -1345,8 +1391,16 @@ class DeepseekV2Attention(nn.Module):
         W_UV = W_kv[:, self.qk_nope_head_dim :, :]  # [H, v_head_dim,       kv_lora_rank]
 
         # q_abs = q_nope @ W_UK  → [B, H, q_len, kv_lora_rank]
-        # 推导：q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
-        q_abs = torch.einsum("bhqd,hdr->bhqr", q_nope, W_UK)
+        # Do this head-by-head via matmul to stay under 16 MB per head at 16k,
+        # instead of einsum("bhqd,hdr->bhqr") which broadcasts to a 5-D
+        # intermediate [B,H,q_len,qk_nope_head_dim,R] → ~34 GB at 16k.
+        q_abs_list = []
+        for h in range(self.num_heads):
+            qh = torch.matmul(q_nope[:, h:h+1, :, :].float(),
+                              W_UK[h:h+1].float())
+            q_abs_list.append(qh.to(q_nope.dtype))
+        q_abs = torch.cat(q_abs_list, dim=1)
+        del q_abs_list
 
         # ── Update cache: 存 latent（key_cache）和 k_pe（value_cache）───────
         # key_cache   ← c_kv_normed  [B, 1, S, kv_lora_rank=512]
@@ -1357,12 +1411,35 @@ class DeepseekV2Attention(nn.Module):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
 
+            # ---- Chunked-prefill awareness ----
+            # _chunked_prefill_active: set by DeepseekV2Model._chunked_forward()
+            #   on ALL chunks of a chunked prefill.
+            # _chunked_prefill_final:  set only on the LAST chunk.
+            # _chunked_prefill_total:  total tokens across all chunks.
+            _chunked_active = getattr(self, '_chunked_prefill_active', False)
+            _chunked_final  = getattr(self, '_chunked_prefill_final',  False)
+            _chunked_total  = getattr(self, '_chunked_prefill_total',  0)
+
             # 必须在 update 前检查：update 后本层 cache 必然非空，检查失效
+            # Chunked prefill: the final chunk must trigger eviction even though
+            # past_key_value is non-empty (earlier chunks already populated it).
             _is_first_prefill = (
                 q_len > 1
                 and self.latent_eviction
-                and past_key_value.get_seq_length(self.layer_idx) == 0
+                and (
+                    past_key_value.get_seq_length(self.layer_idx) == 0
+                    or _chunked_final  # final chunk of chunked prefill
+                )
             )
+
+            # Chunked prefill: suppress eviction on intermediate (non-final) chunks
+            if _chunked_active and not _chunked_final:
+                _is_first_prefill = False
+
+            # Chunked prefill: suppress eviction on intermediate chunks.
+            # Only the FINAL chunk triggers eviction (with full-cached-latent scoring).
+            if _chunked_active and not _chunked_final:
+                _is_first_prefill = False
 
             # update() 拼接 past + current，返回完整序列的 latent 和 k_pe
             # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]
@@ -1388,8 +1465,18 @@ class DeepseekV2Attention(nn.Module):
                 # ── 委员会层：计算本层 importance scores 并累积 ────────────────
                 _eviction_mode = getattr(self, 'latent_eviction_mode', 'committee')
                 if _eviction_mode == 'committee' and self.layer_idx in score_layers:
-                    _info_this = self._compute_importance_scores(
-                        c_kv_normed, q_abs=q_abs, W_UV=W_UV)
+                    if _chunked_final:
+                        # Final chunk: score the FULL cached_latent using the
+                        # last chunk's q_abs (the only Q we have).  Some
+                        # recency bias exists, but query-aware scoring gives
+                        # a far more discriminative importance distribution
+                        # than the statistical fallback.
+                        _full_latent = cached_latent.squeeze(1)  # [B, full_seq_len, R]
+                        _info_this = self._compute_importance_scores(
+                            _full_latent, q_abs=q_abs, W_UV=W_UV)
+                    else:
+                        _info_this = self._compute_importance_scores(
+                            c_kv_normed, q_abs=q_abs, W_UV=W_UV)
                     if _info_this is not None:
                         if not hasattr(past_key_value, '_evict_scores_list'):
                             past_key_value._evict_scores_list = []
@@ -1407,11 +1494,18 @@ class DeepseekV2Attention(nn.Module):
                             c_kv_normed, q_abs=q_abs, W_UV=W_UV)
 
                     if _agg_info is not None:
-                        _n_sink_d   = min(self.latent_eviction_sink_tokens,   q_len)
-                        _n_recent_d = min(self.latent_eviction_recent_tokens,
-                                          max(0, q_len - _n_sink_d))
+                        if _chunked_final:
+                            _total_len  = cached_latent.shape[2]
+                            _n_sink_d   = min(self.latent_eviction_sink_tokens,   _total_len)
+                            _n_recent_d = min(self.latent_eviction_recent_tokens,
+                                              max(0, _total_len - _n_sink_d))
+                        else:
+                            _n_sink_d   = min(self.latent_eviction_sink_tokens,   q_len)
+                            _n_recent_d = min(self.latent_eviction_recent_tokens,
+                                              max(0, q_len - _n_sink_d))
 
-                        keep_indices = self._compute_keep_indices(c_kv_normed, _agg_info)
+                        _c_for_keep = _full_latent if _chunked_final else c_kv_normed
+                        keep_indices = self._compute_keep_indices(_c_for_keep, _agg_info)
                         past_key_value.shared_keep_indices = keep_indices
                         past_key_value._shared_agg_info    = (_agg_info, _n_sink_d, _n_recent_d)
 
@@ -1420,21 +1514,29 @@ class DeepseekV2Attention(nn.Module):
                         _pool_r  = getattr(self, 'latent_eviction_pool_ratio', 0)
                         _pool_t  = getattr(self, 'latent_eviction_pool_temperature', 0.1)
 
-                        for _prev in range(D):
-                            if len(past_key_value.key_cache) > _prev:
-                                _pl = past_key_value.key_cache[_prev]
-                                _pk = past_key_value.value_cache[_prev]
-                                _tl = _pl.gather(2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1]))
-                                _tk = _pk.gather(2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1]))
-                                if _pool_r > 0:
-                                    _sc, _sk = self._make_super_tokens(
-                                        _pl, _pk, keep_indices, _agg_info,
-                                        _n_sink_d, _n_recent_d, _pool_r, _pool_t)
-                                    if _sc is not None:
-                                        _tl = torch.cat([_tl, _sc],  dim=2)
-                                        _tk = torch.cat([_tk, _sk],  dim=2)
-                                past_key_value.key_cache[_prev]   = _tl
-                                past_key_value.value_cache[_prev] = _tk
+                        # 修剪 Layer 0..D（包括 decision layer）。
+                        # D 层之后的层还没完成当前 chunk 的 cache update，
+                        # keep_indices 里的全序列索引会越界。
+                        for _prev in range(D + 1):
+                            if _prev >= len(past_key_value.key_cache):
+                                break
+                            _pl = past_key_value.key_cache[_prev]
+                            _pk = past_key_value.value_cache[_prev]
+                            _tl = _pl.gather(2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1]))
+                            _tk = _pk.gather(2, _ret_idx.expand(-1, 1, -1, _pk.shape[-1]))
+                            if _pool_r > 0:
+                                _sc, _sk = self._make_super_tokens(
+                                    _pl, _pk, keep_indices, _agg_info,
+                                    _n_sink_d, _n_recent_d, _pool_r, _pool_t)
+                                if _sc is not None:
+                                    _tl = torch.cat([_tl, _sc],  dim=2)
+                                    _tk = torch.cat([_tk, _sk],  dim=2)
+                            past_key_value.key_cache[_prev]   = _tl
+                            past_key_value.value_cache[_prev] = _tk
+                        # Release the full-length storage referenced by _pl/_pk
+                        del _pl, _pk, _tl, _tk, _ret_idx
+                        if _pool_r > 0 and _sc is not None:
+                            del _sc, _sk
 
                         # 清理临时累积分数
                         if hasattr(past_key_value, '_evict_scores_list'):
@@ -1516,47 +1618,69 @@ class DeepseekV2Attention(nn.Module):
             cached_latent = c_kv_normed_4d  # [B, 1, q_len, kv_lora_rank]
             cached_kpe    = k_pe             # [B, 1, q_len, qk_rope_head_dim]
 
-        # ── 注意力分数 ─────────────────────────────────────────────────────
-        # W_UK / W_UV / q_abs 已在 cache update 前计算完毕（见上方）。
-        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
-        # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
-        content_score = torch.matmul(q_abs, cached_latent.transpose(-1, -2))
-        rope_score    = torch.matmul(q_pe,  cached_kpe.transpose(-1, -2))
-        attn_weights  = (content_score + rope_score) * self.softmax_scale
-        # [B, H, q_len, kv_seq_len]
+        # ── Chunked MLA attention (no O(S²) materialization) ────────────────
+        # MLA decomposes Q·K^T = q_abs·latent^T + q_pe·k_pe^T.  Both terms
+        # produce [B,H,q_len,kv_seq_len] — too large to materialise at 16k+.
+        # We chunk Q into small pieces (CHUNK=16); each score slice is
+        # [B,H,16,kv_seq_len] which stays easily in memory even at 64k.
+        #
+        # All einsum calls have been replaced with torch.matmul to avoid
+        # 5-D broadcast intermediates that can reach tens of gigabytes.
 
-        kv_seq_len = cached_latent.shape[2]  # 以实际 cached_latent 为准
+        kv_seq_len = cached_latent.shape[2]  # actual (possibly evicted) cache length
+        dev        = cached_latent.device
+        CHUNK      = 16  # [B,H,16,S] at 32k bf16 ≈ 17 MB per score matrix
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, "
-                f"but is {attn_weights.size()}"
+        outputs: list = []
+        for _start in range(0, q_len, CHUNK):
+            _end = min(_start + CHUNK, q_len)
+
+            # ── content score  [B, H, chunk_sz, kv_seq_len]
+            content_c = torch.matmul(
+                q_abs[:, :, _start:_end, :],
+                cached_latent.transpose(-1, -2),
             )
-        assert attention_mask is not None
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, "
-                    f"but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+            # ── rope score  [B, H, chunk_sz, kv_seq_len]
+            rope_c = torch.matmul(
+                q_pe[:, :, _start:_end, :],
+                cached_kpe.transpose(-1, -2),
+            )
+            scores_c = (content_c + rope_c) * self.softmax_scale
+            del content_c, rope_c
 
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(q_nope.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
+            # ── Causal mask ──────────────────────────────────────────────
+            if q_len > 1:
+                col_idx = torch.arange(kv_seq_len, device=dev)
+                row_idx = torch.arange(_start, _end, device=dev)
+                causal  = row_idx.unsqueeze(1) >= col_idx.unsqueeze(0)
+                scores_c = scores_c.masked_fill(
+                    ~causal[None, None], float("-inf"))
 
-        # ── 输出：通过吸收后的 V 权重聚合 ─────────────────────────────────
-        # output = attn @ v = attn @ (W_UV c) = (attn @ c) @ W_UV^T
-        # 先对 latent 做加权求和，再用 W_UV 投影一次，不展开所有 S 个 v 向量。
-        # attn_weights  : [B, H, q_len, kv_seq_len]
-        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
-        weighted_latent = torch.matmul(attn_weights, cached_latent)
-        # [B, H, q_len, kv_lora_rank]
-        attn_output = torch.einsum("bhqr,hdr->bhqd", weighted_latent, W_UV)
-        # [B, H, q_len, v_head_dim]
+            if attention_mask is not None:
+                mask_c = attention_mask[:, :, _start:_end, :kv_seq_len]
+                scores_c = scores_c + mask_c
+
+            # ── softmax → weighted latent → value projection ────────────
+            attn_c  = nn.functional.softmax(scores_c, dim=-1, dtype=torch.float32)
+            attn_c  = attn_c.to(q_nope.dtype)
+            del scores_c
+
+            attn_c          = nn.functional.dropout(attn_c, p=self.attention_dropout, training=self.training)
+            weighted_latent = torch.matmul(attn_c, cached_latent)           # [B,H,chunk,R]
+            del attn_c
+
+            # matmul avoids einsum's 5-D broadcast (up to 2 GB even for a small chunk)
+            # weighted_latent: [B,H,chunk,R]  W_UV: [H,d_v,R]
+            out_c = torch.matmul(weighted_latent, W_UV.transpose(-1, -2))   # [B,H,chunk,d_v]
+            del weighted_latent
+
+            # Move each chunk to CPU to cap GPU memory at one chunk's worth
+            # of output tensors + one score matrix.
+            outputs.append(out_c.cpu())
+
+        attn_output = torch.cat(outputs, dim=2).to(dev)
+        del outputs
+        # attn_output: [B, H, q_len, v_head_dim]
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
@@ -2181,6 +2305,127 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def _chunked_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.LongTensor,
+        past_key_values,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        batch_size: int,
+        seq_length: int,
+        use_legacy_cache: bool,
+    ):
+        """Chunked prefill: split long sequence into 4K chunks.
+
+        Each chunk flows through ALL decoder layers.  The KV cache accumulates
+        via DynamicCache.update().  Eviction fires only on the final chunk.
+        Peak memory is bounded at 4K-level intermediates regardless of total
+        sequence length.
+        """
+        CHUNK_SIZE = 4096
+        num_chunks = (seq_length + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        # ---- Arm chunked-prefill flags on all attention layers ----
+        for layer in self.layers:
+            layer.self_attn._chunked_prefill_active = True
+            layer.self_attn._chunked_prefill_final  = False
+            layer.self_attn._chunked_prefill_total  = seq_length
+
+        all_hidden_states = []
+        next_decoder_cache = None
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * CHUNK_SIZE
+            chunk_end   = min(chunk_start + CHUNK_SIZE, seq_length)
+            chunk_len   = chunk_end - chunk_start
+
+            # ---- Mark final chunk for eviction trigger ----
+            is_final = (chunk_idx == num_chunks - 1)
+            if is_final:
+                for layer in self.layers:
+                    layer.self_attn._chunked_prefill_final = True
+
+            # ---- Slice inputs for this chunk ----
+            chunk_embeds = inputs_embeds[:, chunk_start:chunk_end, :]
+            chunk_pos_ids = position_ids[:, chunk_start:chunk_end]
+
+            # ---- Build per-chunk 4D causal mask ----
+            # past_key_values_length = chunk_start (tokens already in cache)
+            # Pass None as the padding mask — causal masking is sufficient
+            # for chunked prefill. The original attention_mask may not match
+            # the chunk shape (e.g. [1, 6144] vs [1, 4096]).
+            chunk_attn_mask = _prepare_4d_causal_attention_mask(
+                None,
+                (batch_size, chunk_len),
+                chunk_embeds,
+                chunk_start,
+            )
+
+            # ---- Run all decoder layers ----
+            hidden_states = chunk_embeds
+            for decoder_layer in self.layers:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=chunk_attn_mask,
+                    position_ids=chunk_pos_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = layer_outputs[0]
+                if use_cache:
+                    next_decoder_cache = layer_outputs[
+                        2 if output_attentions else 1
+                    ]
+
+            all_hidden_states.append(hidden_states)
+
+            # Release chunk intermediates immediately
+            del chunk_embeds, chunk_attn_mask, hidden_states
+
+        # ---- Concatenate chunk outputs ----
+        hidden_states = torch.cat(all_hidden_states, dim=1)
+        del all_hidden_states
+
+        # ---- Clean up chunked-prefill flags ----
+        for layer in self.layers:
+            layer.self_attn._chunked_prefill_active = False
+            layer.self_attn._chunked_prefill_final  = False
+            layer.self_attn._chunked_prefill_total  = 0
+
+        # ---- Apply final layer norm ----
+        hidden_states = self.norm(hidden_states)
+
+        # ---- Signal CausalLM that chunked prefill was used ----
+        # So it can skip full-sequence lm_head to avoid logits.float() OOM.
+        self._did_chunked_prefill = True
+
+        next_cache = None
+        if use_cache:
+            next_cache = (
+                next_decoder_cache.to_legacy_cache()
+                if use_legacy_cache
+                else next_decoder_cache
+            )
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [hidden_states, next_cache, None, None]
+                if v is not None
+            )
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=None,
+            attentions=None,
+        )
+
     @add_start_docstrings_to_model_forward(DeepseekV2_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -2248,6 +2493,37 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        # ---- Chunked prefill: split long prefill into 4K chunks ----
+        # Only active when:
+        #   - eager attention (not flash_attn_2 — incompatible K/V layout)
+        #   - use_cache=True
+        #   - first prefill (past_key_values_length == 0, no existing cache)
+        #   - sequence length > CHUNK_SIZE
+        #   - batch_size == 1 (multi-batch would desync cache sizes)
+        CHUNK_SIZE = 4096
+        _do_chunk = (
+            not self._use_flash_attention_2
+            and use_cache
+            and seq_length > CHUNK_SIZE
+            and past_key_values_length == 0
+            and batch_size == 1
+        )
+
+        if _do_chunk:
+            return self._chunked_forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                batch_size=batch_size,
+                seq_length=seq_length,
+                use_legacy_cache=use_legacy_cache,
+            )
 
         if self._use_flash_attention_2:
             # 2d mask is passed through the layers
@@ -2476,7 +2752,16 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+
+        # After chunked prefill, hidden_states can be 16K+.  lm_head produces
+        # [B, 16K, vocab_size] which is ~3.4 GB in bf16 and ~6.7 GB after .float().
+        # Since prefill logits are never consumed by downstream eval code (only
+        # past_key_values matters), compute lm_head only on the last position.
+        if getattr(self.model, '_did_chunked_prefill', False) and labels is None:
+            logits = self.lm_head(hidden_states[:, -1:, :])
+            self.model._did_chunked_prefill = False
+        else:
+            logits = self.lm_head(hidden_states)
         logits = logits.float()
 
         loss = None
