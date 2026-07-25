@@ -798,8 +798,8 @@ class DeepseekV2Attention(nn.Module):
         # keep_k = max( knee_k, cov_k ) where:
         #   knee_k = argmax_k[ C(k) - k/n ]  (elbow of cumulative-mass curve)
         #   cov_k  = min k s.t. C(k) >= coverage_floor
-        self.latent_eviction_coverage_floor  = 0.85  # min fraction of importance mass to retain
-        self.latent_eviction_min_keep        = 0.30  # hard lower bound on mid-token keep ratio
+        self.latent_eviction_coverage_floor  = 0.55  # min fraction of importance mass to retain
+        self.latent_eviction_min_keep        = 0.20  # hard lower bound on mid-token keep ratio
         self.latent_eviction_max_keep        = 0.98  # hard upper bound (always evict >= 2%)
         # ---- Multi-layer committee scoring ----------------------------------
         # Layers in score_layers each compute importance scores independently.
