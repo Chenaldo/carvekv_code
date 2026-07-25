@@ -965,12 +965,24 @@ class DeepseekV2Attention(nn.Module):
         dist   = cumsum - x.unsqueeze(0)                             # [B, n]
         knee_k = int(dist.argmax(dim=-1).max().item()) + 1           # 1-indexed, batch-max
 
-        # 4. Coverage floor: min k s.t. C(k) >= coverage_floor
+        # 4. Coverage floor: min k s.t. C(k) >= coverage_floor.
+        # For chunked prefill (near-uniform score distributions), lower
+        # the effective coverage floor so the knee (not coverage) wins.
         cov_k  = int(
             (cumsum >= coverage_floor).long().argmax(dim=-1).max().item()
         ) + 1
 
-        # 5. Take the larger (guarantee coverage floor)
+        # 5. max(knee, cov) with a lower coverage floor for chunked prefill.
+        # Standard prefill uses cov=0.85; chunked prefill has near-uniform
+        # scores (no causal mask gradient), so cov would lock at 85%.
+        # Use a lower cov=0.55 so the knee (typically 35-55%) wins instead.
+        _cov_floor = coverage_floor if getattr(self, '_chunked_prefill_final', False) else coverage_floor
+        # For chunked prefill, use min(coverage_floor, 0.55)
+        if getattr(self, '_chunked_prefill_final', False):
+            _cov_floor = min(_cov_floor, 0.55)
+        cov_k  = int(
+            (cumsum >= _cov_floor).long().argmax(dim=-1).max().item()
+        ) + 1
         keep_k = max(knee_k, cov_k)
 
         # 6. Hard ratio bounds
