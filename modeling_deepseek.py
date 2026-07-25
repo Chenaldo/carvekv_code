@@ -944,16 +944,15 @@ class DeepseekV2Attention(nn.Module):
         n      = info_mid.shape[1]
         device = info_mid.device
 
-        # 1. Shift to non-negative, then amplify via squaring.
-        # Squaring converts a 5:1 head:tail ratio into a 25:1 ratio —
-        # the cumulative mass curve rises much faster, the knee lands
-        # further left, and eviction becomes more aggressive.
-        # Without amplification, near-uniform score distributions
-        # (common when q_abs << n_mid in the final chunk of chunked prefill)
-        # produce a knee near n/2 and coverage_floor dominates at 0.85.
+        # 1. Shift to non-negative, then amplify via exponentiation.
+        # An exponent of 4.0 converts a modest 3:1 head:tail ratio into
+        # an 81:1 ratio: the cumulative-mass curve rises much faster,
+        # the knee lands further left, and eviction becomes more aggressive.
+        # Without amplification, near-uniform score distributions (common
+        # in chunked prefill) produce a knee near n/2 and coverage_floor wins.
         scores = info_mid.float()
         scores = scores - scores.min(dim=-1, keepdim=True).values   # [B, n] >= 0
-        scores = scores ** 2                                         # amplify
+        scores = scores ** 4.0                                       # amplify
         total  = scores.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         mass   = scores / total                                      # [B, n], row-sums to 1
 
