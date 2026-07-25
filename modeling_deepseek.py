@@ -53,7 +53,10 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
+try:
+    from transformers.utils.import_utils import is_torch_fx_available
+except ImportError:
+    is_torch_fx_available = lambda: False
 from .configuration_deepseek import DeepseekV2Config
 import torch.distributed as dist
 import numpy as np
@@ -1372,7 +1375,7 @@ class DeepseekV2Attention(nn.Module):
         q_abs_list = []
         for h in range(self.num_heads):
             qh = torch.matmul(q_nope[:, h:h+1, :, :].float(),
-                              W_UK[h:h+1].float().transpose(-1, -2))
+                              W_UK[h:h+1].float())
             q_abs_list.append(qh.to(q_nope.dtype))
         q_abs = torch.cat(q_abs_list, dim=1)
         del q_abs_list
@@ -2320,8 +2323,11 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
 
             # ---- Build per-chunk 4D causal mask ----
             # past_key_values_length = chunk_start (tokens already in cache)
+            # Pass None as the padding mask — causal masking is sufficient
+            # for chunked prefill. The original attention_mask may not match
+            # the chunk shape (e.g. [1, 6144] vs [1, 4096]).
             chunk_attn_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
+                None,
                 (batch_size, chunk_len),
                 chunk_embeds,
                 chunk_start,
