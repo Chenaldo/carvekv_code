@@ -944,15 +944,9 @@ class DeepseekV2Attention(nn.Module):
         n      = info_mid.shape[1]
         device = info_mid.device
 
-        # 1. Shift to non-negative, then amplify via exponentiation.
-        # An exponent of 4.0 converts a modest 3:1 head:tail ratio into
-        # an 81:1 ratio: the cumulative-mass curve rises much faster,
-        # the knee lands further left, and eviction becomes more aggressive.
-        # Without amplification, near-uniform score distributions (common
-        # in chunked prefill) produce a knee near n/2 and coverage_floor wins.
+        # 1. Shift to non-negative, normalise to mass distribution
         scores = info_mid.float()
         scores = scores - scores.min(dim=-1, keepdim=True).values   # [B, n] >= 0
-        scores = scores ** 4.0                                       # amplify
         total  = scores.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         mass   = scores / total                                      # [B, n], row-sums to 1
 
@@ -965,24 +959,12 @@ class DeepseekV2Attention(nn.Module):
         dist   = cumsum - x.unsqueeze(0)                             # [B, n]
         knee_k = int(dist.argmax(dim=-1).max().item()) + 1           # 1-indexed, batch-max
 
-        # 4. Coverage floor: min k s.t. C(k) >= coverage_floor.
-        # For chunked prefill (near-uniform score distributions), lower
-        # the effective coverage floor so the knee (not coverage) wins.
+        # 4. Coverage floor: min k s.t. C(k) >= coverage_floor
         cov_k  = int(
             (cumsum >= coverage_floor).long().argmax(dim=-1).max().item()
         ) + 1
 
-        # 5. max(knee, cov) with a lower coverage floor for chunked prefill.
-        # Standard prefill uses cov=0.85; chunked prefill has near-uniform
-        # scores (no causal mask gradient), so cov would lock at 85%.
-        # Use a lower cov=0.55 so the knee (typically 35-55%) wins instead.
-        _cov_floor = coverage_floor if getattr(self, '_chunked_prefill_final', False) else coverage_floor
-        # For chunked prefill, use min(coverage_floor, 0.55)
-        if getattr(self, '_chunked_prefill_final', False):
-            _cov_floor = min(_cov_floor, 0.55)
-        cov_k  = int(
-            (cumsum >= _cov_floor).long().argmax(dim=-1).max().item()
-        ) + 1
+        # 5. Take the larger (guarantee coverage floor)
         keep_k = max(knee_k, cov_k)
 
         # 6. Hard ratio bounds
