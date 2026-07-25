@@ -1033,7 +1033,11 @@ class DeepseekV2Attention(nn.Module):
             q_mid_len = q_mid.shape[2]
             K = min(self.latent_eviction_score_queries, q_mid_len, n_mid)
 
-            sample_pos  = torch.randperm(q_mid_len, device=device)[:K].sort().values
+            # Sample queries from the FRONT of the chunk.
+            # Front queries have diverse causal reach across mid positions,
+            # creating the score gradient that knee detection needs.
+            # Back queries all see the full mid range → uniform scores.
+            sample_pos = torch.arange(K, device=device)
             q_scored    = q_mid[:, :, sample_pos, :]
 
             raw_logits = torch.matmul(
