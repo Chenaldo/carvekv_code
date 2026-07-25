@@ -1473,8 +1473,7 @@ class DeepseekV2Attention(nn.Module):
                             _n_recent_d = min(self.latent_eviction_recent_tokens,
                                               max(0, q_len - _n_sink_d))
 
-                        _c_for_keep = _full_latent if _chunked_final else c_kv_normed
-                        keep_indices = self._compute_keep_indices(_c_for_keep, _agg_info)
+                        keep_indices = self._compute_keep_indices(c_kv_normed, _agg_info)
                         past_key_value.shared_keep_indices = keep_indices
                         past_key_value._shared_agg_info    = (_agg_info, _n_sink_d, _n_recent_d)
 
