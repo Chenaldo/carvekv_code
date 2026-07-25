@@ -1017,18 +1017,32 @@ class DeepseekV2Attention(nn.Module):
             val_norm = val_norm / v_mean
 
         if q_abs is not None:
-            q_mid = q_abs[:, :, n_sink : seq_len - n_recent, :]
-            K = min(self.latent_eviction_score_queries, n_mid)
-
-            if K < n_mid:
-                sample_pos  = torch.randperm(n_mid, device=device)[:K].sort().values
-                q_scored    = q_mid[:, :, sample_pos, :]
-                causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
-                               > sample_pos.unsqueeze(1))
+            # q_abs may be shorter than compressed_kv (chunked prefill final
+            # chunk: q_abs covers only the last chunk while compressed_kv is
+            # the full sequence).  Use q_abs directly, subsampling K query
+            # positions, and build a causal mask that correctly reflects the
+            # global positions of these queries.
+            q_len = q_abs.shape[2]
+            if q_len > n_mid:
+                # Normal case: q_abs >= n_mid. Slice conventionally.
+                q_mid   = q_abs[:, :, n_sink : seq_len - n_recent, :]
+                q_start = n_sink
             else:
-                q_scored    = q_mid
-                causal_mask = ~torch.tril(
-                    torch.ones(n_mid, n_mid, device=device, dtype=torch.bool))
+                # Mismatched: q_abs is shorter. Use it as-is (it comes from
+                # the END of the sequence). All queries can attend to all
+                # mid tokens since they're past the mid range.
+                q_mid   = q_abs
+                q_start = seq_len - q_len  # global position of first query
+            q_mid_len = q_mid.shape[2]
+            K = min(self.latent_eviction_score_queries, q_mid_len, n_mid)
+
+            sample_pos  = torch.randperm(q_mid_len, device=device)[:K].sort().values
+            q_scored    = q_mid[:, :, sample_pos, :]
+            # Global positions of sampled queries
+            q_global_pos = sample_pos + q_start  # [K]
+            causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
+                           > q_global_pos.unsqueeze(1) - n_sink)
+            # If q_start > n_sink + n_mid (query is fully past mid), no masking needed
 
             attn_logits = torch.matmul(
                 q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
