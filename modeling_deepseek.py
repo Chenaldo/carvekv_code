@@ -1017,47 +1017,26 @@ class DeepseekV2Attention(nn.Module):
             val_norm = val_norm / v_mean
 
         if q_abs is not None:
-            q_len = q_abs.shape[2]
-            if q_len > n_mid:
-                # Normal case: q_abs >= n_mid. Slice conventionally with
-                # causal mask + col_sum — proven to produce 50-70% compress.
-                q_mid   = q_abs[:, :, n_sink : seq_len - n_recent, :]
-                q_start = n_sink
-            else:
-                # Mismatched: q_abs is shorter (last chunk of multi-chunk
-                # prefill). Use raw logit magnitude — skip softmax entirely.
-                # Softmax over 6K keys with no causal mask collapses to
-                # 1/6000 per key and kills discriminability.
-                q_mid   = q_abs
-                q_start = seq_len - q_len
-            q_mid_len = q_mid.shape[2]
-            K = min(self.latent_eviction_score_queries, q_mid_len, n_mid)
+            # Score local chunk via causal mask — proven 50-70% compression
+            # for single-chunk prefill. Uses local positions so causal mask
+            # creates natural gradient across mid tokens.
+            mid_local = compressed_kv[:, n_sink : seq_len - n_recent, :]
+            K = min(self.latent_eviction_score_queries, q_abs.shape[2], n_mid)
 
-            # Sample queries from the FRONT of the chunk.
-            # Front queries have diverse causal reach across mid positions,
-            # creating the score gradient that knee detection needs.
-            # Back queries all see the full mid range → uniform scores.
-            sample_pos = torch.arange(K, device=device)
-            q_scored    = q_mid[:, :, sample_pos, :]
+            sample_pos  = torch.randperm(q_abs.shape[2], device=device)[:K].sort().values
+            q_scored    = q_abs[:, :, sample_pos, :]
 
             raw_logits = torch.matmul(
-                q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
+                q_scored, mid_local.unsqueeze(1).transpose(-1, -2)
             ) * self.softmax_scale  # [B, H, K, n_mid]
 
-            if q_len > n_mid:
-                # Standard path: causal mask + softmax + col_sum
-                row_global = sample_pos + q_start
-                causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
-                               > (row_global - n_sink).unsqueeze(1))
-                raw_logits = raw_logits.masked_fill(
-                    causal_mask[None, None], float("-inf"))
-                attn_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32)
-                score   = attn_probs.sum(dim=2)                 # [B, H, n_mid]
-            else:
-                # Short-q_abs path: no softmax — use raw logit max.
-                # col_sum after softmax collapses to uniform when there's
-                # no causal mask to create gradient.
-                score = raw_logits.float().max(dim=2).values    # [B, H, n_mid]
+            # Local-position causal mask
+            row_pos = sample_pos  # 0-indexed within chunk
+            causal_mask = torch.arange(n_mid, device=device).unsqueeze(0) > row_pos.unsqueeze(1)
+            raw_logits = raw_logits.masked_fill(
+                causal_mask[None, None], float("-inf"))
+            attn_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32)
+            score   = attn_probs.sum(dim=2)                 # [B, H, n_mid]
 
             if val_norm is not None:
                 info_mid = (score * val_norm.unsqueeze(1)).mean(dim=1)
