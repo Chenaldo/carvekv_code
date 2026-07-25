@@ -1399,11 +1399,20 @@ class DeepseekV2Attention(nn.Module):
             _chunked_total  = getattr(self, '_chunked_prefill_total',  0)
 
             # 必须在 update 前检查：update 后本层 cache 必然非空，检查失效
+            # Chunked prefill: the final chunk must trigger eviction even though
+            # past_key_value is non-empty (earlier chunks already populated it).
             _is_first_prefill = (
                 q_len > 1
                 and self.latent_eviction
-                and past_key_value.get_seq_length(self.layer_idx) == 0
+                and (
+                    past_key_value.get_seq_length(self.layer_idx) == 0
+                    or _chunked_final  # final chunk of chunked prefill
+                )
             )
+
+            # Chunked prefill: suppress eviction on intermediate (non-final) chunks
+            if _chunked_active and not _chunked_final:
+                _is_first_prefill = False
 
             # Chunked prefill: suppress eviction on intermediate chunks.
             # Only the FINAL chunk triggers eviction (with full-cached-latent scoring).
@@ -1481,13 +1490,12 @@ class DeepseekV2Attention(nn.Module):
                         _pool_r  = getattr(self, 'latent_eviction_pool_ratio', 0)
                         _pool_t  = getattr(self, 'latent_eviction_pool_temperature', 0.1)
 
-                        # In-place trimming of ALL past layers including the
-                        # decision layer itself — every layer's cache is
-                        # trimmed (or kept as-is if already trimmed before
-                        # the forward pass) so that PyTorch's caching
-                        # allocator can reuse the old, larger storage for
-                        # the trimmed result, avoiding peak doubling.
-                        for _prev in range(len(past_key_value.key_cache)):
+                        # 修剪 Layer 0..D（包括 decision layer）。
+                        # D 层之后的层还没完成当前 chunk 的 cache update，
+                        # keep_indices 里的全序列索引会越界。
+                        for _prev in range(D + 1):
+                            if _prev >= len(past_key_value.key_cache):
+                                break
                             _pl = past_key_value.key_cache[_prev]
                             _pk = past_key_value.value_cache[_prev]
                             _tl = _pl.gather(2, _ret_idx.expand(-1, 1, -1, _pl.shape[-1]))
