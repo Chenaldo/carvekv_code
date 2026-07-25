@@ -1019,34 +1019,46 @@ class DeepseekV2Attention(nn.Module):
         if q_abs is not None:
             # q_abs may be shorter than compressed_kv (chunked prefill final
             # chunk: q_abs covers only the last chunk while compressed_kv is
-            # the full sequence).  Use q_abs directly, subsampling K query
-            # positions, and build a causal mask that correctly reflects the
-            # global positions of these queries.
+            # the full sequence).  We still build a causal mask — it is the
+            # ONLY source of score gradient across token positions.  Without it,
+            # every key gets equivalent attention from every query and the
+            # score distribution collapses to uniform.
             q_len = q_abs.shape[2]
             if q_len > n_mid:
                 # Normal case: q_abs >= n_mid. Slice conventionally.
                 q_mid   = q_abs[:, :, n_sink : seq_len - n_recent, :]
                 q_start = n_sink
             else:
-                # Mismatched: q_abs is shorter. Use it as-is (it comes from
-                # the END of the sequence). All queries can attend to all
-                # mid tokens since they're past the mid range.
+                # Mismatched: q_abs is shorter (last chunk of a multi-chunk
+                # prefill). Use it as-is; queries live at global positions
+                # [q_start, q_start+q_len) — well past the mid range.
                 q_mid   = q_abs
-                q_start = seq_len - q_len  # global position of first query
+                q_start = seq_len - q_len   # first query global position
             q_mid_len = q_mid.shape[2]
-            K = min(self.latent_eviction_score_queries, q_mid_len, n_mid)
+            K = min(self.latent_eviction_score_queries, q_mid_len)
 
-            sample_pos  = torch.randperm(q_mid_len, device=device)[:K].sort().values
-            q_scored    = q_mid[:, :, sample_pos, :]
+            # Sample queries biased toward the END (largest causal reach).
+            weights = torch.arange(1, q_mid_len + 1, device=device, dtype=torch.float32)
+            sample_pos = torch.multinomial(
+                weights, min(K, q_mid_len), replacement=False
+            ).sort().values
+            q_scored = q_mid[:, :, sample_pos, :]
 
             attn_logits = torch.matmul(
                 q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
             ) * self.softmax_scale
-            # Max logit over sampled queries: "how strongly is the single
-            # most interested query attending to this key?"  Much more
-            # discriminative than col_sum (which uniformises because
-            # softmax distributes mass evenly across keys with no causal mask).
-            col_max     = attn_logits.float().max(dim=2).values       # [B, H, n_mid]
+            # Causal mask: query at global position g can only see keys < g.
+            # For the short-q_abs case, q_start >= n_sink + n_mid, so every
+            # sampled query can see ALL mid tokens and the mask is a no-op.
+            row_global = sample_pos + q_start           # [K]  absolute positions
+            causal_mask = (torch.arange(n_mid, device=device).unsqueeze(0)
+                           > (row_global - n_sink).unsqueeze(1))
+            attn_logits = attn_logits.masked_fill(
+                causal_mask[None, None], float("-inf"))
+            attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
+            # Max over queries: "how much does the SINGLE most interested
+            # query attend to this key?"  Sharper than col_sum.
+            col_max = attn_probs.max(dim=2).values           # [B, H, n_mid]
 
             if val_norm is not None:
                 info_mid = (col_max * val_norm.unsqueeze(1)).mean(dim=1)
