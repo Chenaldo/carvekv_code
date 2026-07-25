@@ -1444,18 +1444,8 @@ class DeepseekV2Attention(nn.Module):
                 # ── 委员会层：计算本层 importance scores 并累积 ────────────────
                 _eviction_mode = getattr(self, 'latent_eviction_mode', 'committee')
                 if _eviction_mode == 'committee' and self.layer_idx in score_layers:
-                    if _chunked_final:
-                        # Final chunk: score the FULL cached_latent using the
-                        # last chunk's q_abs (the only Q we have).  Some
-                        # recency bias exists, but query-aware scoring gives
-                        # a far more discriminative importance distribution
-                        # than the statistical fallback.
-                        _full_latent = cached_latent.squeeze(1)  # [B, full_seq_len, R]
-                        _info_this = self._compute_importance_scores(
-                            _full_latent, q_abs=q_abs, W_UV=W_UV)
-                    else:
-                        _info_this = self._compute_importance_scores(
-                            c_kv_normed, q_abs=q_abs, W_UV=W_UV)
+                    _info_this = self._compute_importance_scores(
+                        c_kv_normed, q_abs=q_abs, W_UV=W_UV)
                     if _info_this is not None:
                         if not hasattr(past_key_value, '_evict_scores_list'):
                             past_key_value._evict_scores_list = []
