@@ -1042,18 +1042,16 @@ class DeepseekV2Attention(nn.Module):
             attn_logits = torch.matmul(
                 q_scored, mid_latent.unsqueeze(1).transpose(-1, -2)
             ) * self.softmax_scale
-            # No causal mask: this is a *scoring* function, not attention.
-            # Causal correctness would destroy the score distribution (earlier
-            # mid-tokens get zero attention from all sampled queries), making
-            # knee detection fail and coverage_floor dominate.
-            # Softmax over the full dimension gives a proper importance signal.
-            attn_probs  = torch.softmax(attn_logits, dim=-1, dtype=torch.float32)
-            col_sum     = attn_probs.sum(dim=2)                        # [B, H, n_mid]
+            # Max logit over sampled queries: "how strongly is the single
+            # most interested query attending to this key?"  Much more
+            # discriminative than col_sum (which uniformises because
+            # softmax distributes mass evenly across keys with no causal mask).
+            col_max     = attn_logits.float().max(dim=2).values       # [B, H, n_mid]
 
             if val_norm is not None:
-                info_mid = (col_sum * val_norm.unsqueeze(1)).mean(dim=1)
+                info_mid = (col_max * val_norm.unsqueeze(1)).mean(dim=1)
             else:
-                info_mid = col_sum.mean(dim=1)
+                info_mid = col_max.mean(dim=1)
         else:
             info_stat = compute_latent_info_score(compressed_kv, window=self.latent_eviction_window)
             info_mid  = info_stat[:, n_sink : seq_len - n_recent].float()
