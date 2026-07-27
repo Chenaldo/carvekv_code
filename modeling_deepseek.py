@@ -723,7 +723,8 @@ class DeepseekV2Attention(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
-        ##一口气把公式 (38) 的内容部分（nope）和公式 (39) 准备做 RoPE 的位置部分（rope）都生成出来了
+        ##Construct both parts at once: content part from Eq. (38) (nope)
+        ##and positional part for RoPE from Eq. (39) (rope).
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
         self.is_causal = True
@@ -733,20 +734,20 @@ class DeepseekV2Attention(nn.Module):
                 self.hidden_size, self.num_heads * self.q_head_dim, bias=False
             )
         else:
-            ##将hidden_size映射到q_lora_rank维度
+            ##Project hidden_size to q_lora_rank.
             self.q_a_proj = nn.Linear(
                 self.hidden_size, config.q_lora_rank, bias=config.attention_bias
             )
-            ##用来对q_a_proj的输出进行归一化
+            ##Normalize the output of q_a_proj.
             self.q_a_layernorm = DeepseekV2RMSNorm(config.q_lora_rank)
-            ##将q_lora_rank维度映射到num_heads * q_head_dim维度，向上解压，输出维度为 num_heads * q_head_dim
+            ##Expand q_lora_rank to num_heads * q_head_dim.
             self.q_b_proj = nn.Linear(
                 config.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
 
-        ##从输入h_t(hidden_size) 中一次性投影出两根向量的拼接体
-        ##第一部分维度是 kv_lora_rank，公式 (41) 中大名鼎鼎的 Latent
-        ##第二部分维度是 qk_rope_head_dim，它是公式 (43) 中用于位置编码的k_t^R
+        ##Project h_t (hidden_size) once into a concatenation of two vectors.
+        ##Part 1 has dimension kv_lora_rank: the latent in Eq. (41).
+        ##Part 2 has dimension qk_rope_head_dim: k_t^R for positional encoding in Eq. (43).
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
@@ -754,8 +755,9 @@ class DeepseekV2Attention(nn.Module):
         )
         self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank)
 
-        ##(self.q_head_dim - self.qk_rope_head_dim) 其实就等于 qk_nope_head_dim（即 Key 的内容维度k_t^C）
-        ##再加上 v_head_dim（即 Value 的内容维度v_t^C）。这就完美对应了公式 (42) 和 (45) 的解压过程
+        ##(self.q_head_dim - self.qk_rope_head_dim) equals qk_nope_head_dim
+        ##(content dimension of key, k_t^C). Together with v_head_dim (content
+        ##dimension of value, v_t^C), this matches the expansion in Eqs. (42) and (45).
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
             self.num_heads
@@ -778,12 +780,12 @@ class DeepseekV2Attention(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        # ----- 预计算 kv_b_proj 的权重分割（weight absorption 用）-----
-        # 在 __init__ 里做一次，避免每次 forward 都重新 view。
-        # 注意：这是 view（零拷贝），不新增参数，不影响梯度。
+        # ----- Precompute kv_b_proj weight split for weight absorption -----
+        # Do this once in __init__ to avoid repeated views in forward.
+        # This is a zero-copy view: no new parameters and no gradient impact.
         # W_UK [H, qk_nope_head_dim, kv_lora_rank] : latent → k_nope
         # W_UV [H, v_head_dim,       kv_lora_rank] : latent → v
-        # （实际拆分在 forward 里执行，因为 kv_b_proj 的权重在 __init__ 结束后才确定）
+        # (The actual split is performed in forward, after kv_b_proj weights are set.)
 
         # ----- Latent Eviction Config (MLA KV Cache Compression Research) -----
         # Budget is decided per-sequence via the elbow (knee) of the sorted
@@ -845,8 +847,8 @@ class DeepseekV2Attention(nn.Module):
         # -----------------------------------------------------------------------
 
 
-##根据模型的配置，初始化对应的旋转位置编码（Rotary Position Embedding, 简称 RoPE）模块
-##注意力机制（Attention）本身是无法感知词语先后顺序的，必须通过“位置编码”来告诉模型每个词的位置
+##Initialize the rotary position embedding (RoPE) module based on model config.
+##Attention is order-agnostic by itself, so position encoding is required.
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = DeepseekV2RotaryEmbedding(
@@ -1096,33 +1098,33 @@ class DeepseekV2Attention(nn.Module):
     def _compute_keep_indices(
         self,
         compressed_kv: torch.Tensor,
-        aggregated_info_mid: torch.Tensor,   # [B, n_mid] — averaged over committee layers
+        aggregated_info_mid: torch.Tensor,   # [B, n_mid] - averaged over committee layers
     ) -> torch.Tensor:
-        """[核心优化点 1：Adaptive Budget from Multi-Layer Committee Scores]
+        """Adaptive budget from multi-layer committee scores.
 
         Receives pre-computed importance scores (averaged over all committee layers)
         and returns the token indices to keep.
 
-        Budget 决策：肘部法（Knee Detection）+ 覆盖率下界
-          · knee_k = argmax_k[ C(k) − k/n ]   （曲线距对角线最远点）
+                Budget decision: knee detection plus coverage lower bound.
+                    - knee_k = argmax_k[ C(k) - k/n ]   (furthest point above the diagonal)
           · cov_k  = min k s.t. C(k) >= latent_eviction_coverage_floor
           · keep_k = max(knee_k, cov_k)
 
-        无条件保护：
-          · 前 latent_eviction_sink_tokens   个 token（attention sink）
-          · 后 latent_eviction_recent_tokens 个 token（recency 偏差）
+                Always protected:
+                    - first latent_eviction_sink_tokens tokens (attention sinks)
+                    - last latent_eviction_recent_tokens tokens (recency bias)
 
         Args:
-            compressed_kv       : [B, S, kv_lora_rank]  归一化 latent
-            aggregated_info_mid : [B, n_mid]  multi-layer averaged importance scores
+            compressed_kv       : [B, S, kv_lora_rank] normalized latent
+            aggregated_info_mid : [B, n_mid] multi-layer averaged importance scores
 
         Returns:
-            keep_indices  : [B, keep_k]  按时序升序
+            keep_indices  : [B, keep_k] in ascending temporal order
         """
         bsz, seq_len, R = compressed_kv.shape
         device = compressed_kv.device
 
-        # ── Sink / Recency 保护边界 ────────────────────────────────────────
+        # Sink/recency protected boundaries.
         n_sink   = min(self.latent_eviction_sink_tokens,   seq_len)
         n_recent = min(self.latent_eviction_recent_tokens, max(0, seq_len - n_sink))
         n_mid    = seq_len - n_sink - n_recent
@@ -1135,7 +1137,7 @@ class DeepseekV2Attention(nn.Module):
             )
             return keep_idx
 
-        # ── 自适应 Budget（使用多层委员会聚合的 importance scores）──────────
+        # Adaptive budget using committee-aggregated importance scores.
         n_mid_keep = self._adaptive_budget(
             aggregated_info_mid,
             coverage_floor = self.latent_eviction_coverage_floor,
@@ -1151,7 +1153,7 @@ class DeepseekV2Attention(nn.Module):
             )
             return keep_idx
 
-        # ── Top-K 选中间段，拼合 Sink + 中间 + Recent ─────────────────────
+        # Top-k select mid segment and concatenate sink + mid + recent.
         mid_order    = aggregated_info_mid.argsort(dim=-1, descending=True)[:, :n_mid_keep]
         mid_keep_idx = (mid_order + n_sink).sort(dim=-1).values
 
@@ -1278,7 +1280,7 @@ class DeepseekV2Attention(nn.Module):
 
         Attention via weight absorption (no K/V expansion at inference time):
             content_score = q_absorbed @ cached_latent^T
-            where q_absorbed = einsum(q_nope, W_UK)    推导：
+            where q_absorbed = einsum(q_nope, W_UK)    derivation:
               q_nope^T k_nope = q_nope^T (W_UK c) = (W_UK^T q_nope)^T c
 
             rope_score = q_pe @ cached_kpe^T
@@ -1323,8 +1325,9 @@ class DeepseekV2Attention(nn.Module):
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
-        # 驱逐后物理 cache 短于真实序列长度；position_ids 仍携带真实绝对位置，
-        # 须把 rotary 表扩展到真实最大位置，否则 cos[position_ids] 越界。
+        # After eviction, the physical cache can be shorter than the true sequence length.
+        # position_ids still carry true absolute positions, so rotary tables must be extended
+        # to the real maximum position; otherwise cos[position_ids] can go out of bounds.
         rotary_seq_len = kv_seq_len
         if self.latent_eviction and position_ids is not None:
             rotary_seq_len = max(rotary_seq_len, int(position_ids.max()) + 1)
@@ -1333,9 +1336,9 @@ class DeepseekV2Attention(nn.Module):
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
         # k_pe : [B, 1, q_len, qk_rope_head_dim]  (RoPE applied)
 
-        # ── 权重吸收：提前拆分 kv_b_proj（q_abs 供 eviction scoring 使用）──────
-        # 必须在 cache update 前计算，否则 _compute_keep_indices 拿不到 q_abs。
-        # view 是零拷贝操作，不增加参数，不影响梯度。
+        # Weight absorption: split kv_b_proj in advance (q_abs is used for eviction scoring).
+        # This must be computed before cache update, or _compute_keep_indices cannot use q_abs.
+        # view is zero-copy, adds no parameters, and does not affect gradients.
         W_kv = self.kv_b_proj.weight.view(
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
@@ -1345,26 +1348,26 @@ class DeepseekV2Attention(nn.Module):
         W_UV = W_kv[:, self.qk_nope_head_dim :, :]  # [H, v_head_dim,       kv_lora_rank]
 
         # q_abs = q_nope @ W_UK  → [B, H, q_len, kv_lora_rank]
-        # 推导：q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
+        # Derivation: q_nope^T k_nope = q_nope^T W_UK c = (W_UK^T q_nope)^T c
         q_abs = torch.einsum("bhqd,hdr->bhqr", q_nope, W_UK)
 
-        # ── Update cache: 存 latent（key_cache）和 k_pe（value_cache）───────
-        # key_cache   ← c_kv_normed  [B, 1, S, kv_lora_rank=512]
-        # value_cache ← k_pe         [B, 1, S, qk_rope_head_dim=64]
-        # 两者合计 576 维/token，比展开 K/V 的 4096 维节省约 7×。
+        # Update cache: store latent (key_cache) and k_pe (value_cache).
+        # key_cache   <- c_kv_normed  [B, 1, S, kv_lora_rank=512]
+        # value_cache <- k_pe         [B, 1, S, qk_rope_head_dim=64]
+        # Total is 576 dims/token, about 7x smaller than expanded K/V (4096 dims).
         c_kv_normed_4d = c_kv_normed.unsqueeze(1)  # [B, 1, q_len, kv_lora_rank]
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
 
-            # 必须在 update 前检查：update 后本层 cache 必然非空，检查失效
+            # Must check before update: after update this layer cache is always non-empty.
             _is_first_prefill = (
                 q_len > 1
                 and self.latent_eviction
                 and past_key_value.get_seq_length(self.layer_idx) == 0
             )
 
-            # update() 拼接 past + current，返回完整序列的 latent 和 k_pe
+            # update() concatenates past + current and returns full-sequence latent and k_pe.
             # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]
             # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
             cached_latent, cached_kpe = past_key_value.update(
@@ -1372,20 +1375,20 @@ class DeepseekV2Attention(nn.Module):
             )
 
             if _is_first_prefill:
-                # [核心优化点 3：多层委员会决策 + 软驱逐 Super Tokens]
+                # Multi-layer committee + soft-eviction super tokens.
                 #
-                # 多层评分委员会:
-                #   score_layers 中每一层独立计算 importance scores 并累积；
-                #   decision_layer（最后一层）对所有层的分数取均值，得到更稳定的
-                #   综合重要度，再调用 _compute_keep_indices 做最终驱逐决策。
+                # Committee scoring:
+                #   each layer in score_layers computes importance scores independently;
+                #   decision_layer (the last layer) averages scores across layers for a
+                #   more stable aggregate before final eviction via _compute_keep_indices.
                 #
-                # 软驱逐 Super Tokens:
-                #   被驱逐的 mid tokens 按 pool_ratio 组做加权池化，生成 super tokens
-                #   追加到 cache 末尾，供后续 decode 的 attention 使用。
+                # Soft eviction via super tokens:
+                #   evicted mid tokens are pooled by pool_ratio into weighted super tokens
+                #   appended to cache for subsequent decode attention.
                 D            = self.latent_eviction_decision_layer
                 score_layers = set(getattr(self, 'latent_eviction_score_layers', [D]))
 
-                # ── 委员会层：计算本层 importance scores 并累积 ────────────────
+                # Committee layers: compute and accumulate per-layer importance scores.
                 _eviction_mode = getattr(self, 'latent_eviction_mode', 'committee')
                 if _eviction_mode == 'committee' and self.layer_idx in score_layers:
                     _info_this = self._compute_importance_scores(
@@ -1397,7 +1400,7 @@ class DeepseekV2Attention(nn.Module):
 
                 keep_indices = None
 
-                # ── 决策层：聚合委员会分数 → 驱逐 + super tokens ─────────────
+                # Decision layer: aggregate committee scores, then evict and append super tokens.
                 if _eviction_mode == 'committee' and self.layer_idx == D:
                     _scores_list = getattr(past_key_value, '_evict_scores_list', None)
                     if _scores_list:
@@ -1415,7 +1418,7 @@ class DeepseekV2Attention(nn.Module):
                         past_key_value.shared_keep_indices = keep_indices
                         past_key_value._shared_agg_info    = (_agg_info, _n_sink_d, _n_recent_d)
 
-                        # ── 溯源修剪 Layer 0..D-1 + 追加 super tokens ──────────
+                        # Retroactively trim layers 0..D-1 and append super tokens.
                         _ret_idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B,1,keep_k,1]
                         _pool_r  = getattr(self, 'latent_eviction_pool_ratio', 0)
                         _pool_t  = getattr(self, 'latent_eviction_pool_temperature', 0.1)
@@ -1436,7 +1439,7 @@ class DeepseekV2Attention(nn.Module):
                                 past_key_value.key_cache[_prev]   = _tl
                                 past_key_value.value_cache[_prev] = _tk
 
-                        # 清理临时累积分数
+                        # Clear temporary accumulated scores.
                         if hasattr(past_key_value, '_evict_scores_list'):
                             del past_key_value._evict_scores_list
 
@@ -1479,7 +1482,7 @@ class DeepseekV2Attention(nn.Module):
                         if self.layer_idx == self.config.num_hidden_layers - 1:
                             past_key_value._seen_tokens = _tl.shape[2]
                 elif keep_indices is not None:
-                    # [核心优化点 4：双轨同步切片（latent + k_pe）+ super tokens]
+                    # Synchronously trim both tracks (latent + k_pe) and append super tokens.
                     idx = keep_indices.unsqueeze(1).unsqueeze(-1)  # [B, 1, keep_k, 1]
                     trimmed_latent = cached_latent.gather(
                         2, idx.expand(-1, 1, -1, cached_latent.shape[-1])
@@ -1488,7 +1491,7 @@ class DeepseekV2Attention(nn.Module):
                         2, idx.expand(-1, 1, -1, cached_kpe.shape[-1])
                     )
 
-                    # 软驱逐：追加 super tokens 到当前层 cache
+                    # Soft eviction: append super tokens to current-layer cache.
                     _pool_r = getattr(self, 'latent_eviction_pool_ratio', 0)
                     if _pool_r > 0:
                         _agg_t, _ns, _nr = getattr(
@@ -1504,28 +1507,28 @@ class DeepseekV2Attention(nn.Module):
                                 trimmed_latent = torch.cat([trimmed_latent, _sc],  dim=2)
                                 trimmed_kpe    = torch.cat([trimmed_kpe,    _sk],  dim=2)
 
-                    # 强制覆写当前层 cache
+                    # Force overwrite current-layer cache.
                     past_key_value.key_cache[self.layer_idx]   = trimmed_latent
                     past_key_value.value_cache[self.layer_idx] = trimmed_kpe
 
-                    # [核心优化点 5：修复 DynamicCache 内置状态]
+                    # Update DynamicCache internal seen-token state.
                     if self.layer_idx == self.config.num_hidden_layers - 1:
                         past_key_value._seen_tokens = trimmed_latent.shape[2]
         else:
-            # 无 cache：只用当前 q_len 个 token
+            # No cache: use only the current q_len tokens.
             cached_latent = c_kv_normed_4d  # [B, 1, q_len, kv_lora_rank]
             cached_kpe    = k_pe             # [B, 1, q_len, qk_rope_head_dim]
 
-        # ── 注意力分数 ─────────────────────────────────────────────────────
-        # W_UK / W_UV / q_abs 已在 cache update 前计算完毕（见上方）。
-        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
+        # Attention scores.
+        # W_UK / W_UV / q_abs were computed before cache update (see above).
+        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  <- broadcast to H heads
         # cached_kpe    : [B, 1, kv_seq_len, qk_rope_head_dim]
         content_score = torch.matmul(q_abs, cached_latent.transpose(-1, -2))
         rope_score    = torch.matmul(q_pe,  cached_kpe.transpose(-1, -2))
         attn_weights  = (content_score + rope_score) * self.softmax_scale
         # [B, H, q_len, kv_seq_len]
 
-        kv_seq_len = cached_latent.shape[2]  # 以实际 cached_latent 为准
+        kv_seq_len = cached_latent.shape[2]  # Use actual cached_latent length.
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -1548,11 +1551,12 @@ class DeepseekV2Attention(nn.Module):
             attn_weights, p=self.attention_dropout, training=self.training
         )
 
-        # ── 输出：通过吸收后的 V 权重聚合 ─────────────────────────────────
+        # Output aggregation via absorbed V weights.
         # output = attn @ v = attn @ (W_UV c) = (attn @ c) @ W_UV^T
-        # 先对 latent 做加权求和，再用 W_UV 投影一次，不展开所有 S 个 v 向量。
+        # First compute weighted sum over latent, then project once with W_UV,
+        # without expanding all S value vectors.
         # attn_weights  : [B, H, q_len, kv_seq_len]
-        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  ← 广播到 H 个头
+        # cached_latent : [B, 1, kv_seq_len, kv_lora_rank]  <- broadcast to H heads
         weighted_latent = torch.matmul(attn_weights, cached_latent)
         # [B, H, q_len, kv_lora_rank]
         attn_output = torch.einsum("bhqr,hdr->bhqd", weighted_latent, W_UV)
